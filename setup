@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ./setup [OPTIONS]
+
+Options:
+  --help      Show this help message and exit.
+  --dry-run   Show planned setup behavior without running it.
+USAGE
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --help)
+      usage
+      exit 0
+      ;;
+    --dry-run)
+      echo "Runtime setup is not implemented yet (placeholder until Containerfile/Podman runtime PR)."
+      exit 0
+      ;;
+    --*)
+      echo "Error: unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+echo "Runtime setup is not implemented yet (placeholder until Containerfile/Podman runtime PR)."
+exit 0

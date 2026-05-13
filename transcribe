@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./transcribe [OPTIONS] INPUT
+
+Options:
+  --help            Show this help message and exit
+  --list-presets    List available runtime presets and exit
+  --gpu             Force GPU mode
+  --cpu             Force CPU mode
+  --out DIR         Use DIR as exact output directory
+  --dry-run         Print parsed configuration and exit
+EOF
+}
+
+list_presets() {
+  cat <<'EOF'
+linux-gpu  Linux with NVIDIA CUDA via Podman
+linux-cpu  Linux CPU-only via Podman
+macos-cpu  macOS CPU-only via Podman
+EOF
+}
+
+err() {
+  echo "error: $*" >&2
+}
+
+mode="auto"
+out_dir=""
+dry_run=0
+input_file=""
+
+while (($#)); do
+  case "$1" in
+    --help)
+      usage
+      exit 0
+      ;;
+    --list-presets)
+      list_presets
+      exit 0
+      ;;
+    --gpu)
+      if [[ "$mode" == "cpu" ]]; then
+        err "--gpu and --cpu cannot be used together"
+        exit 2
+      fi
+      mode="gpu"
+      shift
+      ;;
+    --cpu)
+      if [[ "$mode" == "gpu" ]]; then
+        err "--gpu and --cpu cannot be used together"
+        exit 2
+      fi
+      mode="cpu"
+      shift
+      ;;
+    --out)
+      if [[ $# -lt 2 ]]; then
+        err "--out requires a directory argument"
+        exit 2
+      fi
+      out_dir="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --*)
+      err "unknown option: $1"
+      exit 2
+      ;;
+    *)
+      if [[ -n "$input_file" ]]; then
+        err "expected exactly one input file"
+        exit 2
+      fi
+      input_file="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$input_file" ]]; then
+  err "missing input file"
+  usage >&2
+  exit 2
+fi
+
+if [[ -z "$out_dir" ]]; then
+  input_dir=$(dirname -- "$input_file")
+  input_base=$(basename -- "$input_file")
+  stem="${input_base%.*}"
+  if [[ "$input_dir" == "." ]]; then
+    out_dir="$stem"
+  else
+    out_dir="$input_dir/$stem"
+  fi
+fi
+
+if [[ $dry_run -eq 1 ]]; then
+  printf 'input=%s\n' "$input_file"
+  printf 'output_dir=%s\n' "$out_dir"
+  printf 'mode=%s\n' "$mode"
+  exit 0
+fi
+
+echo "transcription runtime not implemented yet"
+exit 0

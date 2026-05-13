@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+IMAGE_NAME="local-stt-runtime"
+CONTAINERFILE="Containerfile"
+CACHE_DIR="${HOME}/.cache/local-stt-runtime"
+HF_CACHE_DIR="${CACHE_DIR}/huggingface"
+TMP_CACHE_DIR="${CACHE_DIR}/tmp"
+
 usage() {
   cat <<'USAGE'
 Usage: ./setup [OPTIONS]
@@ -8,8 +14,34 @@ Usage: ./setup [OPTIONS]
 Options:
   --help      Show this help message and exit.
   --dry-run   Show planned setup behavior without running it.
+  --rebuild   Rebuild the runtime image without build cache.
 USAGE
 }
+
+require_podman() {
+  if ! command -v podman >/dev/null 2>&1; then
+    echo "Error: podman was not found in PATH. Please install Podman and try again." >&2
+    exit 1
+  fi
+}
+
+print_plan() {
+  local -a build_cmd=("$@")
+  echo "image_name=${IMAGE_NAME}"
+  echo "containerfile=${CONTAINERFILE}"
+  echo "cache_dir=${CACHE_DIR}"
+  echo "build_command=${build_cmd[*]}"
+}
+
+run_setup() {
+  local -a build_cmd=("$@")
+
+  require_podman
+  mkdir -p "${CACHE_DIR}" "${HF_CACHE_DIR}" "${TMP_CACHE_DIR}"
+  "${build_cmd[@]}"
+}
+
+mode="normal"
 
 while (($# > 0)); do
   case "$1" in
@@ -18,8 +50,10 @@ while (($# > 0)); do
       exit 0
       ;;
     --dry-run)
-      echo "Runtime setup is not implemented yet (placeholder until Containerfile/Podman runtime PR)."
-      exit 0
+      mode="dry-run"
+      ;;
+    --rebuild)
+      mode="rebuild"
       ;;
     --*)
       echo "Error: unknown option: $1" >&2
@@ -30,7 +64,17 @@ while (($# > 0)); do
       exit 1
       ;;
   esac
+  shift
 done
 
-echo "Runtime setup is not implemented yet (placeholder until Containerfile/Podman runtime PR)."
-exit 0
+if [[ "${mode}" == "dry-run" ]]; then
+  print_plan podman build -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" .
+  exit 0
+fi
+
+if [[ "${mode}" == "rebuild" ]]; then
+  run_setup podman build --no-cache -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" .
+  exit 0
+fi
+
+run_setup podman build -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" .

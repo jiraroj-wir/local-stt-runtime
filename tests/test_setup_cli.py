@@ -1,15 +1,17 @@
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SETUP = REPO_ROOT / "setup"
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 def run_setup(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["/usr/bin/bash", str(SETUP), *args],
+        [BASH, str(SETUP), *args],
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -62,6 +64,7 @@ def test_setup_runs_podman_build_with_fake_podman(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["FAKE_PODMAN_LOG"] = str(log_file)
+    env["HOME"] = str(tmp_path)
 
     result = run_setup(env=env)
     assert result.returncode == 0
@@ -78,6 +81,7 @@ def test_setup_rebuild_uses_no_cache_with_fake_podman(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["FAKE_PODMAN_LOG"] = str(log_file)
+    env["HOME"] = str(tmp_path)
 
     result = run_setup("--rebuild", env=env)
     assert result.returncode == 0

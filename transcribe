@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ./transcribe [OPTIONS] INPUT
+
+Options:
+  --help            Show this help message and exit.
+  --list-presets    List available runtime presets and exit.
+  --gpu             Force GPU mode.
+  --cpu             Force CPU mode.
+  --out DIR         Use DIR as the exact output directory.
+  --dry-run         Print resolved values without running transcription.
+USAGE
+}
+
+list_presets() {
+  cat <<'PRESETS'
+linux-gpu  Linux with NVIDIA CUDA runtime.
+linux-cpu  Linux CPU runtime through Podman.
+macos-cpu  macOS CPU runtime through Podman.
+PRESETS
+}
+
+mode="auto"
+out_dir=""
+dry_run=false
+input_file=""
+
+while (($# > 0)); do
+  case "$1" in
+    --help)
+      usage
+      exit 0
+      ;;
+    --list-presets)
+      list_presets
+      exit 0
+      ;;
+    --gpu)
+      if [[ "$mode" == "cpu" ]]; then
+        echo "Error: --gpu and --cpu cannot be used together." >&2
+        exit 1
+      fi
+      mode="gpu"
+      shift
+      ;;
+    --cpu)
+      if [[ "$mode" == "gpu" ]]; then
+        echo "Error: --gpu and --cpu cannot be used together." >&2
+        exit 1
+      fi
+      mode="cpu"
+      shift
+      ;;
+    --out)
+      shift
+      if (($# == 0)); then
+        echo "Error: --out requires a directory argument." >&2
+        exit 1
+      fi
+      out_dir="$1"
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --*)
+      echo "Error: unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$input_file" ]]; then
+        echo "Error: exactly one input file is required." >&2
+        exit 1
+      fi
+      input_file="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$input_file" ]]; then
+  echo "Error: exactly one input file is required." >&2
+  exit 1
+fi
+
+if [[ -z "$out_dir" ]]; then
+  input_dir=$(dirname "$input_file")
+  input_base=$(basename "$input_file")
+  stem=${input_base%.*}
+  if [[ "$input_dir" == "." ]]; then
+    out_dir="$stem"
+  else
+    out_dir="$input_dir/$stem"
+  fi
+fi
+
+if [[ "$dry_run" == "true" ]]; then
+  echo "input=$input_file"
+  echo "output_dir=$out_dir"
+  echo "mode=$mode"
+  exit 0
+fi
+
+echo "Transcription execution is not implemented yet. Use --dry-run for parsed output." >&2
+exit 0

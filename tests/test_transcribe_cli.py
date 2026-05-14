@@ -40,22 +40,32 @@ def test_dry_run_default_mode_auto() -> None:
     result = run_transcribe("input.m4a", "--dry-run")
     assert result.returncode == 0
     assert "mode=auto" in result.stdout
-    assert "device=cpu" in result.stdout
-    assert "image=local-stt-runtime" in result.stdout
+    assert "selected_device=auto" in result.stdout
+    assert "podman_image=local-stt-runtime" in result.stdout
 
 
 def test_dry_run_gpu_mode() -> None:
     result = run_transcribe("input.m4a", "--gpu", "--dry-run")
     assert result.returncode == 0
     assert "mode=gpu" in result.stdout
-    assert "device=cuda" in result.stdout
+    assert "selected_device=cuda" in result.stdout
 
 
 def test_dry_run_cpu_mode() -> None:
     result = run_transcribe("input.m4a", "--cpu", "--dry-run")
     assert result.returncode == 0
     assert "mode=cpu" in result.stdout
-    assert "device=cpu" in result.stdout
+    assert "selected_device=cpu" in result.stdout
+
+
+def test_dry_run_does_not_execute_podman(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log, cuda_check_success=False)
+
+    result = run_transcribe("input.m4a", "--dry-run", env=env)
+
+    assert result.returncode == 0
+    assert not podman_log.exists()
 
 
 def test_gpu_and_cpu_conflict_returns_nonzero() -> None:
@@ -104,7 +114,10 @@ def test_cpu_mode_passes_cpu_device_to_runner(tmp_path) -> None:
     result = run_transcribe("input.m4a", "--cpu", env=env)
 
     assert result.returncode == 0
-    assert "--device cpu" in podman_log.read_text(encoding="utf-8")
+    log = podman_log.read_text(encoding="utf-8")
+    assert "nvidia-smi" not in log
+    assert "nvidia.com/gpu=all" not in transcribe_run_line(log)
+    assert "--device cpu" in transcribe_run_line(log)
 
 
 def test_gpu_mode_passes_cuda_device_to_runner(tmp_path) -> None:
@@ -114,7 +127,12 @@ def test_gpu_mode_passes_cuda_device_to_runner(tmp_path) -> None:
     result = run_transcribe("input.m4a", "--gpu", env=env)
 
     assert result.returncode == 0
-    assert "--device cuda" in podman_log.read_text(encoding="utf-8")
+    log = podman_log.read_text(encoding="utf-8")
+    run_line = transcribe_run_line(log)
+    assert "nvidia-smi" in log
+    assert "nvidia.com/gpu=all" in run_line
+    assert "--security-opt=label=disable" in run_line
+    assert "--device cuda" in run_line
 
 
 def test_out_dir_passes_output_dir_to_runner(tmp_path) -> None:
@@ -125,6 +143,50 @@ def test_out_dir_passes_output_dir_to_runner(tmp_path) -> None:
 
     assert result.returncode == 0
     assert "--output-dir transcripts" in podman_log.read_text(encoding="utf-8")
+
+
+def test_gpu_mode_cuda_check_failure_returns_nonzero_without_cpu_fallback(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log, cuda_check_success=False)
+
+    result = run_transcribe("input.m4a", "--gpu", env=env)
+
+    log = podman_log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert "CUDA/CDI GPU check failed" in result.stderr
+    assert "nvidia-smi" in log
+    assert "local-stt-runtime -m app.transcribe" not in log
+
+
+def test_auto_mode_cuda_check_success_uses_cuda_and_gpu_flags(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log, cuda_check_success=True)
+
+    result = run_transcribe("input.m4a", env=env)
+
+    log = podman_log.read_text(encoding="utf-8")
+    run_line = transcribe_run_line(log)
+    assert result.returncode == 0
+    assert "nvidia-smi" in log
+    assert "nvidia.com/gpu=all" in run_line
+    assert "--security-opt=label=disable" in run_line
+    assert "--device cuda" in run_line
+
+
+def test_auto_mode_cuda_check_failure_falls_back_to_cpu_without_gpu_flags(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log, cuda_check_success=False)
+
+    result = run_transcribe("input.m4a", env=env)
+
+    log = podman_log.read_text(encoding="utf-8")
+    run_line = transcribe_run_line(log)
+    assert result.returncode == 0
+    assert "CUDA/CDI GPU check failed; falling back to CPU." in result.stderr
+    assert "nvidia-smi" in log
+    assert "nvidia.com/gpu=all" not in run_line
+    assert "--security-opt=label=disable" not in run_line
+    assert "--device cpu" in run_line
 
 
 def test_podman_run_uses_expected_mounts_and_image(tmp_path) -> None:
@@ -201,6 +263,7 @@ def fake_podman_env(
     podman_log: Path,
     *,
     image_exists: bool = True,
+    cuda_check_success: bool = True,
     home: Path | None = None,
 ) -> dict[str, str]:
     bin_dir = tmp_path / "bin"
@@ -213,6 +276,12 @@ def fake_podman_env(
                 'printf "%s\\n" "$*" >> "$PODMAN_LOG"',
                 'if [[ "$1" == "image" && "$2" == "exists" ]]; then',
                 '  if [[ "$PODMAN_IMAGE_EXISTS" == "1" ]]; then',
+                "    exit 0",
+                "  fi",
+                "  exit 1",
+                "fi",
+                'if [[ "$*" == *"nvidia-smi"* ]]; then',
+                '  if [[ "$PODMAN_CUDA_CHECK_SUCCESS" == "1" ]]; then',
                 "    exit 0",
                 "  fi",
                 "  exit 1",
@@ -230,7 +299,15 @@ def fake_podman_env(
         "HOME": str(home or tmp_path / "home"),
         "PODMAN_LOG": str(podman_log),
         "PODMAN_IMAGE_EXISTS": "1" if image_exists else "0",
+        "PODMAN_CUDA_CHECK_SUCCESS": "1" if cuda_check_success else "0",
     }
+
+
+def transcribe_run_line(log: str) -> str:
+    for line in log.splitlines():
+        if "local-stt-runtime -m app.transcribe" in line:
+            return line
+    raise AssertionError("missing transcription podman run")
 
 
 def get_default_path() -> str:

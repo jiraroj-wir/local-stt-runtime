@@ -200,9 +200,29 @@ def test_podman_run_uses_expected_mounts_and_image(tmp_path) -> None:
     log = podman_log.read_text(encoding="utf-8")
     assert result.returncode == 0
     assert f"-v {REPO_ROOT}:/work" in log
+    assert f"-v {REPO_ROOT}:/repo" in log
     assert f"-v {tmp_path / 'home' / '.cache' / 'local-stt-runtime'}:/cache" in log
+    assert "-e PYTHONPATH=/repo" in log
     assert "local-stt-runtime -m app.transcribe" in log
     assert "--backend faster-whisper" in log
+
+
+def test_transcribe_from_non_repo_cwd_keeps_work_mount_and_adds_repo_import_mount(
+    tmp_path,
+) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log)
+
+    result = run_transcribe("validation.m4a", "--cpu", cwd=work_dir, env=env)
+
+    log = podman_log.read_text(encoding="utf-8")
+    assert result.returncode == 0
+    assert f"-v {work_dir}:/work" in log
+    assert f"-v {REPO_ROOT}:/repo" in log
+    assert "-e PYTHONPATH=/repo" in log
+    assert "-m app.transcribe" in log
 
 
 def test_image_missing_runs_setup_from_transcribe_script_directory(tmp_path) -> None:

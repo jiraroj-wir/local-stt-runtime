@@ -27,6 +27,7 @@ mode="auto"
 out_dir=""
 dry_run=false
 input_file=""
+image_name="local-stt-runtime"
 
 while (($# > 0)); do
   case "$1" in
@@ -98,12 +99,45 @@ if [[ -z "$out_dir" ]]; then
   fi
 fi
 
+case "$mode" in
+  gpu)
+    device="cuda"
+    ;;
+  cpu)
+    device="cpu"
+    ;;
+  auto)
+    # TODO(PR 8): detect CUDA/CDI and fall back to CPU when unavailable.
+    device="cpu"
+    ;;
+esac
+
 if [[ "$dry_run" == "true" ]]; then
   echo "input=$input_file"
   echo "output_dir=$out_dir"
   echo "mode=$mode"
+  echo "device=$device"
+  echo "image=$image_name"
   exit 0
 fi
 
-echo "Transcription execution is not implemented yet. Use --dry-run for parsed output." >&2
-exit 0
+if ! command -v podman >/dev/null 2>&1; then
+  echo "Error: podman is required but was not found in PATH." >&2
+  exit 1
+fi
+
+if ! podman image exists "$image_name"; then
+  ./setup
+fi
+
+cache_dir="$HOME/.cache/local-stt-runtime"
+
+podman run --rm \
+  -v "$PWD:/work" \
+  -v "$cache_dir:/cache" \
+  "$image_name" \
+  -m app.transcribe \
+  "$input_file" \
+  --output-dir "$out_dir" \
+  --device "$device" \
+  --backend fake

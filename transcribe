@@ -146,6 +146,13 @@ case "$mode" in
       device="cuda"
     else
       echo "CUDA/CDI GPU check failed; falling back to CPU." >&2
+      {
+        echo "────────────────────────────────────────"
+        echo "Runtime fallback"
+        echo "  Reason     : CUDA/CDI GPU check failed"
+        echo "  Continuing : CPU"
+        echo "────────────────────────────────────────"
+      } >&2
       device="cpu"
     fi
     ;;
@@ -172,6 +179,7 @@ podman_args+=(
   "$input_file"
   --output-dir "$out_dir"
   --device "$device"
+  --mode "$mode"
   --backend faster-whisper
 )
 

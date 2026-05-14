@@ -183,6 +183,8 @@ def test_auto_mode_cuda_check_failure_falls_back_to_cpu_without_gpu_flags(tmp_pa
     run_line = transcribe_run_line(log)
     assert result.returncode == 0
     assert "CUDA/CDI GPU check failed; falling back to CPU." in result.stderr
+    assert "Runtime fallback" in result.stderr
+    assert "Continuing : CPU" in result.stderr
     assert "nvidia-smi" in log
     assert "nvidia.com/gpu=all" not in run_line
     assert "--security-opt=label=disable" not in run_line

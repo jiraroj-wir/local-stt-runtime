@@ -30,6 +30,7 @@ out_dir=""
 dry_run=false
 input_file=""
 image_name="local-stt-runtime"
+cuda_check_image="nvidia/cuda:12.4.1-base-ubuntu22.04"
 
 while (($# > 0)); do
   case "$1" in
@@ -101,25 +102,17 @@ if [[ -z "$out_dir" ]]; then
   fi
 fi
 
-case "$mode" in
-  gpu)
-    device="cuda"
-    ;;
-  cpu)
-    device="cpu"
-    ;;
-  auto)
-    # TODO(PR 8): detect CUDA/CDI and fall back to CPU when unavailable.
-    device="cpu"
-    ;;
-esac
+planned_device="$mode"
+if [[ "$mode" == "gpu" ]]; then
+  planned_device="cuda"
+fi
 
 if [[ "$dry_run" == "true" ]]; then
   echo "input=$input_file"
   echo "output_dir=$out_dir"
   echo "mode=$mode"
-  echo "device=$device"
-  echo "image=$image_name"
+  echo "selected_device=$planned_device"
+  echo "podman_image=$image_name"
   exit 0
 fi
 
@@ -128,18 +121,58 @@ if ! command -v podman >/dev/null 2>&1; then
   exit 1
 fi
 
+run_cuda_check() {
+  podman run --rm \
+    --device nvidia.com/gpu=all \
+    --security-opt=label=disable \
+    "$cuda_check_image" \
+    nvidia-smi >/dev/null 2>&1
+}
+
+case "$mode" in
+  cpu)
+    device="cpu"
+    ;;
+  gpu)
+    if run_cuda_check; then
+      device="cuda"
+    else
+      echo "Error: CUDA/CDI GPU check failed; cannot continue with --gpu." >&2
+      exit 1
+    fi
+    ;;
+  auto)
+    if run_cuda_check; then
+      device="cuda"
+    else
+      echo "CUDA/CDI GPU check failed; falling back to CPU." >&2
+      device="cpu"
+    fi
+    ;;
+esac
+
 if ! podman image exists "$image_name"; then
   "$script_dir/setup"
 fi
 
 cache_dir="$HOME/.cache/local-stt-runtime"
+podman_args=(run --rm)
+if [[ "$device" == "cuda" ]]; then
+  podman_args+=(
+    --device nvidia.com/gpu=all
+    --security-opt=label=disable
+  )
+fi
 
-podman run --rm \
-  -v "$PWD:/work" \
-  -v "$cache_dir:/cache" \
-  "$image_name" \
-  -m app.transcribe \
-  "$input_file" \
-  --output-dir "$out_dir" \
-  --device "$device" \
+podman_args+=(
+  -v "$PWD:/work"
+  -v "$cache_dir:/cache"
+  "$image_name"
+  -m app.transcribe
+  "$input_file"
+  --output-dir "$out_dir"
+  --device "$device"
   --backend fake
+)
+
+podman "${podman_args[@]}"

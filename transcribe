@@ -172,7 +172,7 @@ podman_args+=(
   "$input_file"
   --output-dir "$out_dir"
   --device "$device"
-  --backend fake
+  --backend faster-whisper
 )
 
 podman "${podman_args[@]}"

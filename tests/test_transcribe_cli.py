@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -9,9 +10,10 @@ def run_transcribe(
     *args: str,
     cwd: Path = REPO_ROOT,
     env: dict[str, str] | None = None,
+    transcribe_path: Path = TRANSCRIBE,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(TRANSCRIBE), *args],
+        [str(transcribe_path), *args],
         cwd=cwd,
         env=env,
         text=True,
@@ -139,21 +141,46 @@ def test_podman_run_uses_expected_mounts_and_image(tmp_path) -> None:
     assert "--backend fake" in log
 
 
-def test_image_missing_triggers_setup_before_podman_run(tmp_path) -> None:
+def test_image_missing_calls_setup_next_to_transcribe_not_cwd_setup(tmp_path) -> None:
+    script_dir = tmp_path / "script-dir"
+    script_dir.mkdir()
+    transcribe_copy = script_dir / "transcribe"
+    shutil.copy2(TRANSCRIBE, transcribe_copy)
+    transcribe_copy.chmod(0o755)
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
     podman_log = tmp_path / "podman.log"
     setup_log = tmp_path / "setup.log"
-    env = fake_podman_env(tmp_path, podman_log, image_exists=False)
-    fake_setup = tmp_path / "setup"
-    fake_setup.write_text(
-        f"#!/usr/bin/env bash\nprintf 'setup\\n' >> {setup_log}\n",
+    env = fake_podman_env(
+        tmp_path,
+        podman_log,
+        image_exists=False,
+    )
+    adjacent_setup = script_dir / "setup"
+    adjacent_setup.write_text(
+        f"#!/usr/bin/env bash\nprintf 'adjacent setup\\n' >> {setup_log}\n",
         encoding="utf-8",
     )
-    fake_setup.chmod(0o755)
+    adjacent_setup.chmod(0o755)
+    cwd_setup = work_dir / "setup"
+    cwd_setup.write_text(
+        "#!/usr/bin/env bash\nexit 97\n",
+        encoding="utf-8",
+    )
+    cwd_setup.chmod(0o755)
 
-    result = run_transcribe("input.m4a", "--out", "out", cwd=tmp_path, env=env)
+    result = run_transcribe(
+        "input.m4a",
+        "--out",
+        "out",
+        cwd=work_dir,
+        env=env,
+        transcribe_path=transcribe_copy,
+    )
 
     assert result.returncode == 0
-    assert setup_log.read_text(encoding="utf-8") == "setup\n"
+    assert setup_log.read_text(encoding="utf-8") == "adjacent setup\n"
     assert "run --rm" in podman_log.read_text(encoding="utf-8")
 
 

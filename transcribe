@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
   cat <<'USAGE'
 Usage: ./transcribe [OPTIONS] INPUT
@@ -127,7 +129,7 @@ if ! command -v podman >/dev/null 2>&1; then
 fi
 
 if ! podman image exists "$image_name"; then
-  ./setup
+  "$script_dir/setup"
 fi
 
 cache_dir="$HOME/.cache/local-stt-runtime"

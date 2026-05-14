@@ -173,7 +173,9 @@ fi
 
 podman_args+=(
   -v "$PWD:/work"
+  -v "$script_dir:/repo"
   -v "$cache_dir:/cache"
+  -e PYTHONPATH=/repo
   "$image_name"
   -m app.transcribe
   "$input_file"

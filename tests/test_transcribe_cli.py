@@ -200,7 +200,7 @@ def test_podman_run_uses_expected_mounts_and_image(tmp_path) -> None:
     assert f"-v {REPO_ROOT}:/work" in log
     assert f"-v {tmp_path / 'home' / '.cache' / 'local-stt-runtime'}:/cache" in log
     assert "local-stt-runtime -m app.transcribe" in log
-    assert "--backend fake" in log
+    assert "--backend faster-whisper" in log
 
 
 def test_image_missing_calls_setup_next_to_transcribe_not_cwd_setup(tmp_path) -> None:

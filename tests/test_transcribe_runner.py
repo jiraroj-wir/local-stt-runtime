@@ -123,3 +123,61 @@ def test_runner_does_not_import_faster_whisper(tmp_path) -> None:
 
     assert exit_code == 0
     assert "faster_whisper" not in sys.modules
+
+
+def test_runner_accepts_faster_whisper_backend_when_available(tmp_path, monkeypatch) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+
+    def fake_transcribe_with_backend(backend, backend_input_path, config):
+        assert backend == "faster-whisper"
+        assert backend_input_path == input_path
+        assert config.device == "cpu"
+        return []
+
+    monkeypatch.setattr("app.transcribe.transcribe_with_backend", fake_transcribe_with_backend)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--backend",
+            "faster-whisper",
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert metadata["backend"] == "faster-whisper"
+
+
+def test_runner_reports_missing_faster_whisper_error(tmp_path, monkeypatch, capsys) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+
+    def fake_transcribe_with_backend(_backend, _backend_input_path, _config):
+        raise RuntimeError(
+            "faster-whisper is not installed; run inside the container or install runtime deps."
+        )
+
+    monkeypatch.setattr("app.transcribe.transcribe_with_backend", fake_transcribe_with_backend)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--device",
+            "cpu",
+            "--backend",
+            "faster-whisper",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert "faster-whisper is not installed" in captured.err

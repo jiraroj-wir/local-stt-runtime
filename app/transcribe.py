@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from app.audio import validate_supported_audio_path
-from app.backends import FAKE_BACKEND_NAME, transcribe_with_backend
+from app.backends import FAKE_BACKEND_NAME, SUPPORTED_BACKENDS, transcribe_with_backend
 from app.config import get_device_config
 from app.output import write_all_outputs
 
@@ -28,7 +28,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     config = get_device_config(args.device)
-    segments = transcribe_with_backend(args.backend, input_path, config)
+    try:
+        segments = transcribe_with_backend(args.backend, input_path, config)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     metadata = {
         "input_path": str(input_path),
         "output_dir": str(output_dir),
@@ -70,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", choices=["cpu", "cuda"], required=True)
     parser.add_argument("--stem")
-    parser.add_argument("--backend", choices=[FAKE_BACKEND_NAME], default=FAKE_BACKEND_NAME)
+    parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default=FAKE_BACKEND_NAME)
     return parser
 
 

@@ -159,7 +159,7 @@ case "$mode" in
 esac
 
 if ! podman image exists "$image_name"; then
-  "$script_dir/setup"
+  (cd "$script_dir" && ./setup)
 fi
 
 cache_dir="$HOME/.cache/local-stt-runtime"

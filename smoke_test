@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Test hooks:
+# - LOCAL_STT_SMOKE_PLATFORM=darwin|linux overrides uname for platform path tests.
+# - LOCAL_STT_SMOKE_TRANSCRIBE=/path/to/transcribe overrides the repo transcribe script.
+# - LOCAL_STT_SMOKE_PYTHON=/path/to/python overrides python3 for optional scoring.
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+separator="────────────────────────────────────────"
+keep_temp=false
+out_dir=""
+
+usage() {
+  cat <<'USAGE'
+Usage: ./smoke_test [OPTIONS]
+
+Options:
+  --keep-temp       Keep the generated temporary validation directory.
+  --out DIR         Use DIR as the exact validation work directory.
+  --help            Show this help message and exit.
+USAGE
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --help)
+      usage
+      exit 0
+      ;;
+    --keep-temp)
+      keep_temp=true
+      shift
+      ;;
+    --out)
+      shift
+      if (($# == 0)); then
+        echo "Error: --out requires a directory argument." >&2
+        exit 1
+      fi
+      out_dir="$1"
+      shift
+      ;;
+    --*)
+      echo "Error: unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: unexpected argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -n "$out_dir" ]]; then
+  work_dir="$out_dir"
+  mkdir -p "$work_dir"
+  cleanup=false
+else
+  work_dir="$(mktemp -d)"
+  cleanup=true
+fi
+
+cleanup_work_dir() {
+  if [[ "$cleanup" == "true" && "$keep_temp" == "false" ]]; then
+    rm -rf "$work_dir"
+  fi
+}
+trap cleanup_work_dir EXIT
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Error: $1 is required for smoke test audio generation." >&2
+    exit 1
+  fi
+}
+
+platform_name() {
+  if [[ -n "${LOCAL_STT_SMOKE_PLATFORM:-}" ]]; then
+    echo "$LOCAL_STT_SMOKE_PLATFORM"
+  else
+    uname_name="$(uname -s)"
+    case "$uname_name" in
+      Darwin)
+        echo "darwin"
+        ;;
+      Linux)
+        echo "linux"
+        ;;
+      *)
+        echo "$uname_name"
+        ;;
+    esac
+  fi
+}
+
+write_reference() {
+  cat > "$work_dir/reference.txt" <<'REFERENCE'
+Local speech to text validation.
+This is a short generated smoke test.
+REFERENCE
+}
+
+generate_audio() {
+  require_command ffmpeg
+
+  platform="$(platform_name)"
+  case "$platform" in
+    darwin)
+      if ! command -v say >/dev/null 2>&1; then
+        echo "Error: no supported TTS tool found. Expected macOS say." >&2
+        exit 1
+      fi
+      say -o "$work_dir/validation.aiff" -f "$work_dir/reference.txt"
+      ffmpeg -y -i "$work_dir/validation.aiff" "$work_dir/validation.m4a"
+      ;;
+    linux)
+      if command -v espeak-ng >/dev/null 2>&1; then
+        espeak-ng -f "$work_dir/reference.txt" -w "$work_dir/validation.wav"
+      elif command -v espeak >/dev/null 2>&1; then
+        espeak -f "$work_dir/reference.txt" -w "$work_dir/validation.wav"
+      else
+        echo "Error: no supported TTS tool found. Expected espeak-ng or espeak." >&2
+        exit 1
+      fi
+      ffmpeg -y -i "$work_dir/validation.wav" "$work_dir/validation.m4a"
+      ;;
+    *)
+      echo "Error: no supported TTS tool found for platform: $platform" >&2
+      exit 1
+      ;;
+  esac
+}
+
+run_transcription() {
+  transcribe_cmd="${LOCAL_STT_SMOKE_TRANSCRIBE:-$script_dir/transcribe}"
+  (
+    cd "$work_dir"
+    "$transcribe_cmd" validation.m4a --cpu --out output
+  )
+}
+
+check_outputs() {
+  expected_files=(
+    "$work_dir/output/validation.txt"
+    "$work_dir/output/validation.srt"
+    "$work_dir/output/validation.json"
+    "$work_dir/output/metadata.json"
+    "$work_dir/output/run.log"
+  )
+
+  for expected_file in "${expected_files[@]}"; do
+    if [[ ! -f "$expected_file" ]]; then
+      echo "Error: expected output file missing: $expected_file" >&2
+      exit 1
+    fi
+  done
+
+  if [[ ! -s "$work_dir/output/validation.txt" ]]; then
+    echo "Error: output transcript is empty: $work_dir/output/validation.txt" >&2
+    exit 1
+  fi
+}
+
+run_score() {
+  score_status="skipped"
+  score_script="$script_dir/scripts/score_transcript.py"
+  python_cmd="${LOCAL_STT_SMOKE_PYTHON:-}"
+  if [[ -z "$python_cmd" ]] && command -v python3 >/dev/null 2>&1; then
+    python_cmd="$(command -v python3)"
+  fi
+
+  if [[ -f "$score_script" && -n "$python_cmd" ]]; then
+    "$python_cmd" "$score_script" "$work_dir/reference.txt" "$work_dir/output/validation.txt"
+    score_status="ran"
+  fi
+}
+
+print_summary() {
+  echo "$separator"
+  echo "LOCAL-STT-RUNTIME SMOKE TEST"
+  echo ""
+  echo "Input"
+  echo "  Work dir   : $work_dir"
+  echo "  Audio      : $work_dir/validation.m4a"
+  echo ""
+  echo "Checks"
+  echo "  Outputs    : present"
+  echo "  Transcript : non-empty"
+  echo ""
+  echo "Score"
+  echo "  Status     : $score_status"
+  echo ""
+  echo "Result"
+  echo "  Status     : PASS"
+  if [[ "$keep_temp" == "true" || -n "$out_dir" ]]; then
+    echo "  Work dir   : $work_dir"
+  fi
+  echo "$separator"
+}
+
+write_reference
+generate_audio
+run_transcription
+check_outputs
+run_score
+print_summary

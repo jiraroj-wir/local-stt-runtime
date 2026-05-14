@@ -205,7 +205,7 @@ def test_podman_run_uses_expected_mounts_and_image(tmp_path) -> None:
     assert "--backend faster-whisper" in log
 
 
-def test_image_missing_calls_setup_next_to_transcribe_not_cwd_setup(tmp_path) -> None:
+def test_image_missing_runs_setup_from_transcribe_script_directory(tmp_path) -> None:
     script_dir = tmp_path / "script-dir"
     script_dir.mkdir()
     transcribe_copy = script_dir / "transcribe"
@@ -223,7 +223,7 @@ def test_image_missing_calls_setup_next_to_transcribe_not_cwd_setup(tmp_path) ->
     )
     adjacent_setup = script_dir / "setup"
     adjacent_setup.write_text(
-        f"#!/usr/bin/env bash\nprintf 'adjacent setup\\n' >> {setup_log}\n",
+        f"#!/usr/bin/env bash\npwd >> {setup_log}\n",
         encoding="utf-8",
     )
     adjacent_setup.chmod(0o755)
@@ -244,7 +244,7 @@ def test_image_missing_calls_setup_next_to_transcribe_not_cwd_setup(tmp_path) ->
     )
 
     assert result.returncode == 0
-    assert setup_log.read_text(encoding="utf-8") == "adjacent setup\n"
+    assert setup_log.read_text(encoding="utf-8") == f"{script_dir}\n"
     assert "run --rm" in podman_log.read_text(encoding="utf-8")
 
 

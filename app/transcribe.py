@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -111,10 +112,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
 
+    isolated_chunks = bool(chunks and args.isolate_chunks)
+    chunk_output_dirs = (
+        _isolated_chunk_output_dirs(output_dir, chunks) if isolated_chunks else []
+    )
+
     try:
         if chunks:
-            _create_chunks(source_path, chunks)
-            segments = _transcribe_chunks(args.backend, config, chunks)
+            _create_chunks(source_path, chunks, isolated=isolated_chunks)
+            if isolated_chunks:
+                segments = _transcribe_chunks_isolated(
+                    backend=args.backend,
+                    config=config,
+                    chunks=chunks,
+                    output_dir=output_dir,
+                    mode=mode,
+                )
+            else:
+                segments = _transcribe_chunks(args.backend, config, chunks)
         else:
             backend_session = create_backend_session(args.backend, config)
             segments = backend_session.transcribe(source_path)
@@ -167,6 +182,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "chunk_minutes": args.chunk_minutes,
         "chunks_count": len(chunks),
         "chunks": [_chunk_metadata(chunk) for chunk in chunks],
+        "isolated_chunks": isolated_chunks,
+        "chunk_output_dirs": [
+            _relative_output_path(path, output_dir) for path in chunk_output_dirs
+        ],
+        "child_processes_count": len(chunk_output_dirs),
         "preprocess_mode": args.preprocess,
         "preprocessing_applied": source_preparation["preprocessing_applied"],
         "audio_preparation_applied": source_preparation["audio_preparation_applied"],
@@ -193,6 +213,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"chunking_enabled={not args.no_chunk}",
         f"chunk_minutes={args.chunk_minutes}",
         f"chunks_count={len(chunks)}",
+        f"isolated_chunks={str(isolated_chunks).lower()}",
+        f"child_processes_count={len(chunk_output_dirs)}",
         f"preprocess_mode={args.preprocess}",
         f"preprocessing_applied={source_preparation['preprocessing_applied']}",
         f"audio_preparation_applied={source_preparation['audio_preparation_applied']}",
@@ -234,6 +256,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default=FAKE_BACKEND_NAME)
     parser.add_argument("--chunk-minutes", type=_positive_float, default=DEFAULT_CHUNK_MINUTES)
     parser.add_argument("--no-chunk", action="store_true")
+    parser.add_argument("--isolate-chunks", action="store_true")
     parser.add_argument(
         "--preprocess",
         choices=["auto", "off", "normalize"],
@@ -288,12 +311,19 @@ def _prepare_source_audio(
     }
 
 
-def _create_chunks(input_path: Path, chunks: list[ChunkPlanItem]) -> None:
+def _create_chunks(
+    input_path: Path,
+    chunks: list[ChunkPlanItem],
+    *,
+    isolated: bool = False,
+) -> None:
     for chunk in chunks:
+        suffix = " isolated" if isolated else ""
         print(
             f"Chunk {chunk.index}/{len(chunks)} "
             f"offset {format_clock(chunk.offset_seconds)} "
-            f"duration {format_clock(chunk.duration_seconds)}",
+            f"duration {format_clock(chunk.duration_seconds)}"
+            f"{suffix}",
             flush=True,
         )
         create_chunk(input_path, chunk)
@@ -310,6 +340,182 @@ def _transcribe_chunks(
         chunk_segments = backend_session.transcribe(chunk.path)
         merged_segments.extend(offset_segments(chunk_segments, chunk.offset_seconds))
     return merged_segments
+
+
+def _transcribe_chunks_isolated(
+    *,
+    backend: str,
+    config,
+    chunks: list[ChunkPlanItem],
+    output_dir: Path,
+    mode: str,
+) -> list[TranscriptionSegment]:
+    merged_segments: list[TranscriptionSegment] = []
+    for chunk in chunks:
+        child_output_dir = _isolated_chunk_output_dir(output_dir, chunk)
+        command = _build_isolated_chunk_command(
+            chunk=chunk,
+            child_output_dir=child_output_dir,
+            backend=backend,
+            device=config.device,
+            mode=_child_process_mode(mode, config.device),
+        )
+        child_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                _isolated_chunk_failure_message(
+                    chunk=chunk,
+                    returncode=None,
+                    stdout="",
+                    stderr=f"failed to start child process: {exc}",
+                )
+            ) from exc
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                _isolated_chunk_failure_message(
+                    chunk=chunk,
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+            )
+
+        chunk_segments = _read_chunk_segments(child_output_dir, chunk.path.stem)
+        merged_segments.extend(offset_segments(chunk_segments, chunk.offset_seconds))
+    return merged_segments
+
+
+def _build_isolated_chunk_command(
+    *,
+    chunk: ChunkPlanItem,
+    child_output_dir: Path,
+    backend: str,
+    device: str,
+    mode: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "app.transcribe",
+        str(chunk.path),
+        "--output-dir",
+        str(child_output_dir),
+        "--device",
+        device,
+        "--backend",
+        backend,
+        "--no-chunk",
+        "--preprocess",
+        "off",
+        "--stem",
+        chunk.path.stem,
+        "--mode",
+        mode,
+    ]
+
+
+def _child_process_mode(mode: str, device: str) -> str:
+    if mode in {"auto", "gpu", "cpu"}:
+        return mode
+    if device == "cuda":
+        return "gpu"
+    return "cpu"
+
+
+def _read_chunk_segments(
+    child_output_dir: Path,
+    stem: str,
+) -> list[TranscriptionSegment]:
+    output_path = child_output_dir / f"{stem}.json"
+    try:
+        data = json.loads(output_path.read_text(encoding="utf-8"))
+        raw_segments = data["segments"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"failed to read isolated chunk output {output_path}: {exc}") from exc
+
+    segments = []
+    for index, segment in enumerate(raw_segments, start=1):
+        try:
+            segments.append(
+                TranscriptionSegment(
+                    start=float(segment["start"]),
+                    end=float(segment["end"]),
+                    text=str(segment["text"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"invalid segment {index} in isolated chunk output {output_path}: {exc}"
+            ) from exc
+    return segments
+
+
+def _isolated_chunk_output_dirs(
+    output_dir: Path,
+    chunks: list[ChunkPlanItem],
+) -> list[Path]:
+    return [_isolated_chunk_output_dir(output_dir, chunk) for chunk in chunks]
+
+
+def _isolated_chunk_output_dir(output_dir: Path, chunk: ChunkPlanItem) -> Path:
+    return output_dir / ".work" / "chunk_outputs" / f"chunk-{chunk.index:04d}"
+
+
+def _relative_output_path(path: Path, output_dir: Path) -> str:
+    try:
+        return str(path.relative_to(output_dir))
+    except ValueError:
+        return str(path)
+
+
+def _isolated_chunk_failure_message(
+    *,
+    chunk: ChunkPlanItem,
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+) -> str:
+    if returncode is None:
+        first_line = (
+            f"isolated chunk {chunk.index} failed at offset "
+            f"{format_clock(chunk.offset_seconds)}"
+        )
+    else:
+        first_line = (
+            f"isolated chunk {chunk.index} failed at offset "
+            f"{format_clock(chunk.offset_seconds)} with return code {returncode}"
+        )
+    summary = _process_output_summary(stdout=stdout, stderr=stderr)
+    if summary:
+        return f"{first_line}\n{summary}"
+    return first_line
+
+
+def _process_output_summary(*, stdout: str, stderr: str) -> str:
+    sections = []
+    stderr_tail = _tail_text(stderr)
+    stdout_tail = _tail_text(stdout)
+    if stderr_tail:
+        sections.append(f"stderr tail:\n{stderr_tail}")
+    if stdout_tail:
+        sections.append(f"stdout tail:\n{stdout_tail}")
+    return "\n".join(sections)
+
+
+def _tail_text(text: str, *, max_lines: int = 20, max_chars: int = 4000) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    lines = stripped.splitlines()[-max_lines:]
+    return "\n".join(lines)[-max_chars:]
 
 
 def _format_chunking_summary(

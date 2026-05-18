@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".aac", ".m4a", ".mp3", ".wav", ".flac", ".ogg"})
+INACCURATE_DURATION_WARNING_TEXT = "Estimating duration from bitrate, this may be inaccurate"
+LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,7 @@ def build_ffprobe_command(input_path: Path) -> list[str]:
     return [
         "ffprobe",
         "-v",
-        "error",
+        "warning",
         "-print_format",
         "json",
         "-show_format",
@@ -92,7 +94,10 @@ def inspect_audio(input_path: Path) -> AudioInspection:
 
     try:
         data = json.loads(result.stdout)
-        return AudioInspection(parse_ffprobe_metadata(data))
+        return AudioInspection(
+            parse_ffprobe_metadata(data),
+            warning=_ffprobe_duration_warning(result.stderr),
+        )
     except (json.JSONDecodeError, ValueError) as exc:
         return AudioInspection(empty_audio_metadata(), warning=f"ffprobe parse failed: {exc}")
 
@@ -134,19 +139,36 @@ def empty_audio_metadata() -> AudioMetadata:
 
 def build_preprocess_command(input_path: Path, output_wav_path: Path) -> list[str]:
     """Build a conservative loudness normalization command."""
-    return [
+    return build_source_audio_command(input_path, output_wav_path, normalize=True)
+
+
+def build_source_audio_command(
+    input_path: Path,
+    output_wav_path: Path,
+    *,
+    normalize: bool,
+) -> list[str]:
+    """Build an ffmpeg command that creates the canonical transcription WAV."""
+    command = [
         "ffmpeg",
         "-y",
         "-i",
         str(input_path),
-        "-af",
-        "loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
-        str(output_wav_path),
     ]
+    if normalize:
+        command.extend(["-af", LOUDNORM_FILTER])
+    command.extend(
+        [
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(output_wav_path),
+        ]
+    )
+    return command
 
 
 def build_volumedetect_command(input_path: Path) -> list[str]:
@@ -163,6 +185,22 @@ def build_volumedetect_command(input_path: Path) -> list[str]:
         "null",
         "-",
     ]
+
+
+def create_source_audio(input_path: Path, output_wav_path: Path, *, normalize: bool) -> None:
+    """Create the canonical 16 kHz mono WAV used for transcription."""
+    output_wav_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        build_source_audio_command(input_path, output_wav_path, normalize=normalize),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def normalize_audio(input_path: Path, output_wav_path: Path) -> None:
+    """Create a normalized 16 kHz mono WAV."""
+    create_source_audio(input_path, output_wav_path, normalize=True)
 
 
 def detect_volume(input_path: Path) -> VolumeStats:
@@ -205,17 +243,6 @@ def should_auto_normalize(stats: VolumeStats) -> bool:
         and stats.mean_volume_db <= -35
         or stats.max_volume_db is not None
         and stats.max_volume_db <= -12
-    )
-
-
-def normalize_audio(input_path: Path, output_wav_path: Path) -> None:
-    """Create a normalized 16 kHz mono WAV."""
-    output_wav_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        build_preprocess_command(input_path, output_wav_path),
-        text=True,
-        capture_output=True,
-        check=True,
     )
 
 
@@ -379,3 +406,9 @@ def _compact_process_error(stderr: str, fallback: str) -> str:
     if not lines:
         return fallback
     return lines[-1]
+
+
+def _ffprobe_duration_warning(stderr: str) -> str | None:
+    if INACCURATE_DURATION_WARNING_TEXT in stderr:
+        return f"ffprobe warning: {INACCURATE_DURATION_WARNING_TEXT}"
+    return None

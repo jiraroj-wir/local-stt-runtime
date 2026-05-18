@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,7 +9,9 @@ from app.audio import (
     build_chunk_command,
     build_ffprobe_command,
     build_preprocess_command,
+    build_source_audio_command,
     build_volumedetect_command,
+    inspect_audio,
     is_supported_audio_path,
     parse_ffprobe_metadata,
     parse_volumedetect_output,
@@ -44,11 +47,32 @@ def test_build_ffprobe_command() -> None:
     command = build_ffprobe_command(input_path)
 
     assert command[0] == "ffprobe"
-    assert ["-v", "error"] == command[1:3]
+    assert ["-v", "warning"] == command[1:3]
     assert ["-print_format", "json"] == command[3:5]
     assert "-show_format" in command
     assert "-show_streams" in command
     assert command[-1] == str(input_path)
+
+
+def test_inspect_audio_preserves_inaccurate_duration_warning(monkeypatch) -> None:
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"format":{"duration":"4245"},'
+                '"streams":[{"codec_type":"audio","codec_name":"aac"}]}'
+            ),
+            stderr="[aac @ 0x123] Estimating duration from bitrate, this may be inaccurate\n",
+        )
+
+    monkeypatch.setattr("app.audio.subprocess.run", fake_run)
+
+    inspection = inspect_audio(Path("lecture.aac"))
+
+    assert inspection.metadata.duration_seconds == 4245.0
+    assert inspection.warning == (
+        "ffprobe warning: Estimating duration from bitrate, this may be inaccurate"
+    )
 
 
 def test_parse_metadata_duration_from_format() -> None:
@@ -212,7 +236,24 @@ def test_build_preprocess_command() -> None:
     ]
     assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
     assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
+    assert ["-c:a", "pcm_s16le"] == command[command.index("-c:a") : command.index("-c:a") + 2]
     assert command[-1] == str(output_wav_path)
+
+
+def test_build_source_audio_command_without_normalization() -> None:
+    command = build_source_audio_command(
+        Path("audio/lecture.m4a"),
+        Path("tmp/lecture.source.wav"),
+        normalize=False,
+    )
+
+    assert command[0] == "ffmpeg"
+    assert "-af" not in command
+    assert command[command.index("-i") + 1] == "audio/lecture.m4a"
+    assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
+    assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
+    assert ["-c:a", "pcm_s16le"] == command[command.index("-c:a") : command.index("-c:a") + 2]
+    assert command[-1] == "tmp/lecture.source.wav"
 
 
 def test_build_volumedetect_command() -> None:

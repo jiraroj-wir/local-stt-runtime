@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import pytest
 
 from app.audio import AudioInspection, AudioMetadata, ChunkPlanItem, VolumeStats
 from app.segments import TranscriptionSegment
-from app.transcribe import main
+from app.transcribe import _build_parser, main
 
 
 @pytest.fixture(autouse=True)
@@ -341,6 +342,251 @@ def test_runner_chunks_long_audio_and_offsets_segments(tmp_path, monkeypatch, ca
     assert data["segments"][2]["start"] == 2405.0
     assert metadata["chunks_count"] == 3
     assert metadata["chunks"][1]["offset_seconds"] == 1200.0
+
+
+def test_runner_parser_accepts_isolate_chunks() -> None:
+    args = _build_parser().parse_args(
+        [
+            "lecture.wav",
+            "--output-dir",
+            "out",
+            "--device",
+            "cuda",
+            "--isolate-chunks",
+        ]
+    )
+
+    assert args.isolate_chunks is True
+
+
+def test_runner_isolate_chunks_has_no_effect_without_planned_chunks(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    transcribed_paths: list[Path] = []
+
+    monkeypatch.setattr(
+        "app.transcribe.inspect_audio",
+        lambda _path: AudioInspection(
+            AudioMetadata(
+                duration_seconds=10 * 60,
+                codec_name="aac",
+                sample_rate=44100,
+                channels=1,
+                bit_rate=None,
+                format_name="mov,mp4",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
+    )
+
+    class FakeSession:
+        def transcribe(self, backend_input_path: Path) -> list[TranscriptionSegment]:
+            transcribed_paths.append(backend_input_path)
+            return []
+
+    def fail_subprocess_run(*_args, **_kwargs):
+        raise AssertionError("isolated child process should not run without chunks")
+
+    monkeypatch.setattr(
+        "app.transcribe.create_backend_session",
+        lambda _backend, _config: FakeSession(),
+    )
+    monkeypatch.setattr("app.transcribe.subprocess.run", fail_subprocess_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert transcribed_paths == [output_dir / ".work" / "source" / "lecture.source.wav"]
+    assert metadata["chunks_count"] == 0
+    assert metadata["isolated_chunks"] is False
+    assert metadata["child_processes_count"] == 0
+    assert metadata["chunk_output_dirs"] == []
+
+
+def test_runner_isolated_chunks_spawn_children_and_merge_offsets(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.transcribe.inspect_audio",
+        lambda _path: AudioInspection(
+            AudioMetadata(
+                duration_seconds=45 * 60,
+                codec_name="aac",
+                sample_rate=44100,
+                channels=1,
+                bit_rate=None,
+                format_name="mov,mp4",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
+    )
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        child_output_dir = Path(command[command.index("--output-dir") + 1])
+        child_stem = command[command.index("--stem") + 1]
+        child_output_dir.mkdir(parents=True, exist_ok=True)
+        (child_output_dir / f"{child_stem}.json").write_text(
+            json.dumps(
+                {
+                    "segments": [
+                        {
+                            "start": 5.0,
+                            "end": 10.0,
+                            "text": f"text from {Path(command[3]).name}",
+                        }
+                    ],
+                    "metadata": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="child ok", stderr="")
+
+    monkeypatch.setattr("app.transcribe.subprocess.run", fake_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--mode",
+            "gpu",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    data = json.loads((output_dir / "lecture.json").read_text(encoding="utf-8"))
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    run_log = (output_dir / "run.log").read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert len(commands) == 3
+    assert "Chunk 1/3 offset 00:00:00 duration 00:20:00 isolated" in captured.out
+    first_command = commands[0]
+    assert first_command[:3] == [sys.executable, "-m", "app.transcribe"]
+    assert first_command[3].endswith("lecture.chunk-0001.wav")
+    assert first_command[first_command.index("--output-dir") + 1] == str(
+        output_dir / ".work" / "chunk_outputs" / "chunk-0001"
+    )
+    assert first_command[first_command.index("--device") + 1] == "cuda"
+    assert first_command[first_command.index("--backend") + 1] == "fake"
+    assert "--no-chunk" in first_command
+    assert first_command[first_command.index("--preprocess") + 1] == "off"
+    assert first_command[first_command.index("--stem") + 1] == "lecture.chunk-0001"
+    assert first_command[first_command.index("--mode") + 1] == "gpu"
+    assert "--isolate-chunks" not in first_command
+    assert data["segments"][0]["start"] == 5.0
+    assert data["segments"][1]["start"] == 1205.0
+    assert data["segments"][2]["start"] == 2405.0
+    assert metadata["isolated_chunks"] is True
+    assert metadata["child_processes_count"] == 3
+    assert metadata["chunk_output_dirs"] == [
+        ".work/chunk_outputs/chunk-0001",
+        ".work/chunk_outputs/chunk-0002",
+        ".work/chunk_outputs/chunk-0003",
+    ]
+    assert "isolated_chunks=true" in run_log
+    assert "child_processes_count=3" in run_log
+
+
+def test_runner_isolated_chunk_failure_returns_transcription_error(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.transcribe.inspect_audio",
+        lambda _path: AudioInspection(
+            AudioMetadata(
+                duration_seconds=45 * 60,
+                codec_name="aac",
+                sample_rate=44100,
+                channels=1,
+                bit_rate=None,
+                format_name="mov,mp4",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
+    )
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            7,
+            stdout="loading model\n",
+            stderr="CUDA out of memory\nlast stderr line\n",
+        )
+
+    monkeypatch.setattr("app.transcribe.subprocess.run", fake_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Stage      : transcription" in captured.err
+    assert "isolated chunk 1 failed at offset 00:00:00 with return code 7" in captured.err
+    assert "stderr tail:" in captured.err
+    assert "CUDA out of memory" in captured.err
+    assert "stdout tail:" in captured.err
+    assert commands[0][commands[0].index("--mode") + 1] == "gpu"
+    assert not (output_dir / "lecture.json").exists()
 
 
 def test_runner_no_chunk_disables_long_audio_chunking(tmp_path, monkeypatch) -> None:

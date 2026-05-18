@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".aac", ".m4a", ".mp3", ".wav", ".flac", ".ogg"})
+INACCURATE_DURATION_WARNING_TEXT = "Estimating duration from bitrate, this may be inaccurate"
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ def build_ffprobe_command(input_path: Path) -> list[str]:
     return [
         "ffprobe",
         "-v",
-        "error",
+        "warning",
         "-print_format",
         "json",
         "-show_format",
@@ -92,7 +93,10 @@ def inspect_audio(input_path: Path) -> AudioInspection:
 
     try:
         data = json.loads(result.stdout)
-        return AudioInspection(parse_ffprobe_metadata(data))
+        return AudioInspection(
+            parse_ffprobe_metadata(data),
+            warning=_ffprobe_duration_warning(result.stderr),
+        )
     except (json.JSONDecodeError, ValueError) as exc:
         return AudioInspection(empty_audio_metadata(), warning=f"ffprobe parse failed: {exc}")
 
@@ -379,3 +383,9 @@ def _compact_process_error(stderr: str, fallback: str) -> str:
     if not lines:
         return fallback
     return lines[-1]
+
+
+def _ffprobe_duration_warning(stderr: str) -> str | None:
+    if INACCURATE_DURATION_WARNING_TEXT in stderr:
+        return f"ffprobe warning: {INACCURATE_DURATION_WARNING_TEXT}"
+    return None

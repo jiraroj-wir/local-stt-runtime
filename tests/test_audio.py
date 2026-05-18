@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from app.audio import (
     build_ffprobe_command,
     build_preprocess_command,
     build_volumedetect_command,
+    inspect_audio,
     is_supported_audio_path,
     parse_ffprobe_metadata,
     parse_volumedetect_output,
@@ -44,11 +46,32 @@ def test_build_ffprobe_command() -> None:
     command = build_ffprobe_command(input_path)
 
     assert command[0] == "ffprobe"
-    assert ["-v", "error"] == command[1:3]
+    assert ["-v", "warning"] == command[1:3]
     assert ["-print_format", "json"] == command[3:5]
     assert "-show_format" in command
     assert "-show_streams" in command
     assert command[-1] == str(input_path)
+
+
+def test_inspect_audio_preserves_inaccurate_duration_warning(monkeypatch) -> None:
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"format":{"duration":"4245"},'
+                '"streams":[{"codec_type":"audio","codec_name":"aac"}]}'
+            ),
+            stderr="[aac @ 0x123] Estimating duration from bitrate, this may be inaccurate\n",
+        )
+
+    monkeypatch.setattr("app.audio.subprocess.run", fake_run)
+
+    inspection = inspect_audio(Path("lecture.aac"))
+
+    assert inspection.metadata.duration_seconds == 4245.0
+    assert inspection.warning == (
+        "ffprobe warning: Estimating duration from bitrate, this may be inaccurate"
+    )
 
 
 def test_parse_metadata_duration_from_format() -> None:

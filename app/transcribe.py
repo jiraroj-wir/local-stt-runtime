@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from app.audio import (
+    INACCURATE_DURATION_WARNING_TEXT,
     ChunkPlanItem,
     create_chunk,
     detect_volume,
@@ -58,15 +59,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode = args.mode or args.device
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_inspection = inspect_audio(input_path)
-    audio_metadata = audio_inspection.metadata
-    chunks = plan_chunks(
-        duration_seconds=audio_metadata.duration_seconds,
-        chunk_minutes=args.chunk_minutes,
-        output_dir=output_dir,
-        stem=stem,
-        enabled=not args.no_chunk,
-    )
+    original_audio_inspection = inspect_audio(input_path)
+    original_audio_metadata = original_audio_inspection.metadata
     start_time = time.monotonic()
     try:
         preprocessing = _prepare_preprocessed_input(
@@ -84,21 +78,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
+    source_path = preprocessing["source_path"]
+    preprocessing_applied = bool(preprocessing["applied"])
+    source_audio_inspection = (
+        inspect_audio(source_path) if preprocessing_applied else original_audio_inspection
+    )
+    source_audio_metadata = source_audio_inspection.metadata
+    chunks = plan_chunks(
+        duration_seconds=_chunk_planning_duration_seconds(
+            source_audio_metadata,
+            original_audio_metadata,
+        ),
+        chunk_minutes=args.chunk_minutes,
+        output_dir=output_dir,
+        stem=stem,
+        enabled=not args.no_chunk,
+    )
+
     print(
         format_start_summary(
             input_path=input_path,
             mode=mode,
             selected_device=config.device,
             model=config.model,
-            duration_seconds=audio_metadata.duration_seconds,
-            audio=format_audio_info(audio_metadata),
+            duration_seconds=original_audio_metadata.duration_seconds,
+            audio=format_audio_info(original_audio_metadata),
             chunking=_format_chunking_summary(chunks, args.chunk_minutes, not args.no_chunk),
-            preprocess=_format_preprocess_summary(args.preprocess, bool(preprocessing["applied"])),
+            preprocess=_format_preprocess_summary(args.preprocess, preprocessing_applied),
         )
     )
 
     try:
-        source_path = preprocessing["source_path"]
         if chunks:
             _create_chunks(source_path, chunks)
             segments = _transcribe_chunks(args.backend, config, chunks)
@@ -121,11 +131,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     elapsed_seconds = time.monotonic() - start_time
     transcribed_duration_seconds = _transcribed_duration_seconds(segments)
-    realtime_duration_seconds = audio_metadata.duration_seconds
+    finish_audio_duration_seconds = _finish_audio_duration_seconds(
+        original_audio_metadata=original_audio_metadata,
+        source_audio_metadata=source_audio_metadata,
+        original_warning=original_audio_inspection.warning,
+        preprocessing_applied=preprocessing_applied,
+    )
+    realtime_duration_seconds = finish_audio_duration_seconds
     if realtime_duration_seconds is None:
         realtime_duration_seconds = transcribed_duration_seconds
     realtime_factor = (
         realtime_duration_seconds / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    )
+    warnings = _warnings(
+        original_audio_inspection.warning,
+        source_audio_inspection.warning if preprocessing_applied else None,
+        preprocessing["warning"],
+        _chunk_planning_warning(
+            original_warning=original_audio_inspection.warning,
+            preprocessing_applied=preprocessing_applied,
+        ),
     )
     metadata = {
         "input_path": str(input_path),
@@ -133,11 +158,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "device": config.device,
         "model": config.model,
         "backend": args.backend,
-        "input_duration_seconds": audio_metadata.duration_seconds,
+        "input_duration_seconds": _reliable_input_duration_seconds(
+            original_audio_metadata,
+            original_audio_inspection.warning,
+        ),
+        "source_duration_seconds": source_audio_metadata.duration_seconds,
         "transcribed_duration_seconds": transcribed_duration_seconds,
         "elapsed_seconds": elapsed_seconds,
         "realtime_factor": realtime_factor,
-        "audio": asdict(audio_metadata),
+        "audio": asdict(original_audio_metadata),
+        "original_audio": asdict(original_audio_metadata),
+        "source_audio": asdict(source_audio_metadata),
         "chunking_enabled": not args.no_chunk,
         "chunk_minutes": args.chunk_minutes,
         "chunks_count": len(chunks),
@@ -147,7 +178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mean_volume_db": preprocessing["mean_volume_db"],
         "max_volume_db": preprocessing["max_volume_db"],
         "preprocessed_path": preprocessing["preprocessed_path"],
-        "warnings": _warnings(audio_inspection.warning, preprocessing["warning"]),
+        "warnings": warnings,
     }
     log_lines = [
         f"input_path={input_path}",
@@ -155,7 +186,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"device={config.device}",
         f"model={config.model}",
         f"backend={args.backend}",
-        f"input_duration_seconds={audio_metadata.duration_seconds}",
+        f"input_duration_seconds={metadata['input_duration_seconds']}",
+        f"source_duration_seconds={source_audio_metadata.duration_seconds}",
         f"transcribed_duration_seconds={transcribed_duration_seconds}",
         f"elapsed_seconds={elapsed_seconds}",
         f"realtime_factor={realtime_factor}",
@@ -180,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         format_finish_summary(
-            audio_duration_seconds=audio_metadata.duration_seconds,
+            audio_duration_seconds=finish_audio_duration_seconds,
             transcribed_duration_seconds=transcribed_duration_seconds,
             elapsed_seconds=elapsed_seconds,
             device=config.device,
@@ -214,6 +246,43 @@ def _transcribed_duration_seconds(segments) -> float:
     if not segments:
         return 0.0
     return max(segment.end for segment in segments)
+
+
+def _chunk_planning_duration_seconds(
+    source_audio_metadata,
+    original_audio_metadata,
+) -> float | None:
+    if source_audio_metadata.duration_seconds is not None:
+        return source_audio_metadata.duration_seconds
+    return original_audio_metadata.duration_seconds
+
+
+def _reliable_input_duration_seconds(
+    original_audio_metadata,
+    original_warning: str | None,
+) -> float | None:
+    if _has_inaccurate_duration_warning(original_warning):
+        return None
+    return original_audio_metadata.duration_seconds
+
+
+def _finish_audio_duration_seconds(
+    *,
+    original_audio_metadata,
+    source_audio_metadata,
+    original_warning: str | None,
+    preprocessing_applied: bool,
+) -> float | None:
+    if (
+        source_audio_metadata.duration_seconds is not None
+        and (
+            preprocessing_applied
+            or _has_inaccurate_duration_warning(original_warning)
+            or original_audio_metadata.duration_seconds is None
+        )
+    ):
+        return source_audio_metadata.duration_seconds
+    return original_audio_metadata.duration_seconds
 
 
 def _prepare_preprocessed_input(
@@ -272,7 +341,9 @@ def _prepare_preprocessed_input(
 def _create_chunks(input_path: Path, chunks: list[ChunkPlanItem]) -> None:
     for chunk in chunks:
         print(
-            f"Chunk {chunk.index}/{len(chunks)} offset {format_clock(chunk.offset_seconds)}",
+            f"Chunk {chunk.index}/{len(chunks)} "
+            f"offset {format_clock(chunk.offset_seconds)} "
+            f"duration {format_clock(chunk.duration_seconds)}",
             flush=True,
         )
         create_chunk(input_path, chunk)
@@ -324,7 +395,28 @@ def _chunk_metadata(chunk: ChunkPlanItem) -> dict[str, object]:
 
 
 def _warnings(*warnings: object) -> list[str]:
-    return [str(warning) for warning in warnings if warning]
+    unique_warnings = []
+    for warning in warnings:
+        if not warning:
+            continue
+        warning_text = str(warning)
+        if warning_text not in unique_warnings:
+            unique_warnings.append(warning_text)
+    return unique_warnings
+
+
+def _chunk_planning_warning(
+    *,
+    original_warning: str | None,
+    preprocessing_applied: bool,
+) -> str | None:
+    if _has_inaccurate_duration_warning(original_warning) and not preprocessing_applied:
+        return "chunk planning may be inaccurate because ffprobe estimated duration from bitrate"
+    return None
+
+
+def _has_inaccurate_duration_warning(warning: str | None) -> bool:
+    return bool(warning and INACCURATE_DURATION_WARNING_TEXT in warning)
 
 
 def _positive_float(value: str) -> float:

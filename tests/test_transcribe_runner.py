@@ -104,10 +104,13 @@ def test_fake_runner_metadata_contains_runtime_contract_fields(tmp_path) -> None
     assert metadata["model"] == "Systran/faster-whisper-large-v3"
     assert metadata["backend"] == "fake"
     assert "input_duration_seconds" in metadata
+    assert "source_duration_seconds" in metadata
     assert "transcribed_duration_seconds" in metadata
     assert "elapsed_seconds" in metadata
     assert "realtime_factor" in metadata
     assert "audio" in metadata
+    assert "original_audio" in metadata
+    assert "source_audio" in metadata
     assert metadata["chunking_enabled"] is True
     assert metadata["chunk_minutes"] == 20
     assert metadata["chunks_count"] == 0
@@ -245,12 +248,15 @@ def test_runner_uses_ffprobe_duration_in_start_finish_and_metadata(
     assert "Audio      : aac, 44.1 kHz, stereo, 128 kbps" in captured.out
     assert "Audio      : 00:20:00" in captured.out
     assert metadata["input_duration_seconds"] == 1200.0
+    assert metadata["source_duration_seconds"] == 1200.0
     assert metadata["audio"]["codec_name"] == "aac"
+    assert metadata["original_audio"]["codec_name"] == "aac"
+    assert metadata["source_audio"]["codec_name"] == "aac"
     assert metadata["mean_volume_db"] == -20
     assert metadata["max_volume_db"] == -3
 
 
-def test_runner_chunks_long_audio_and_offsets_segments(tmp_path, monkeypatch) -> None:
+def test_runner_chunks_long_audio_and_offsets_segments(tmp_path, monkeypatch, capsys) -> None:
     input_path = tmp_path / "lecture.m4a"
     input_path.write_bytes(b"fake audio")
     output_dir = tmp_path / "out"
@@ -306,7 +312,9 @@ def test_runner_chunks_long_audio_and_offsets_segments(tmp_path, monkeypatch) ->
 
     data = json.loads((output_dir / "lecture.json").read_text(encoding="utf-8"))
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    captured = capsys.readouterr()
     assert exit_code == 0
+    assert "Chunk 1/3 offset 00:00:00 duration 00:20:00" in captured.out
     assert len(created_chunks) == 3
     assert data["segments"][0]["start"] == 5.0
     assert data["segments"][1]["start"] == 1205.0
@@ -389,3 +397,132 @@ def test_runner_preprocess_auto_normalizes_quiet_audio(tmp_path, monkeypatch) ->
     assert len(normalized_paths) == 1
     assert metadata["preprocessing_applied"] is True
     assert metadata["preprocessed_path"] == "lecture.normalized.wav"
+
+
+def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.aac"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    raw_aac_warning = (
+        "ffprobe warning: Estimating duration from bitrate, this may be inaccurate"
+    )
+    created_chunks: list[ChunkPlanItem] = []
+
+    def fake_inspect_audio(path: Path) -> AudioInspection:
+        if path.suffix == ".wav":
+            return AudioInspection(
+                AudioMetadata(
+                    duration_seconds=4416.0,
+                    codec_name="pcm_s16le",
+                    sample_rate=16000,
+                    channels=1,
+                    bit_rate=None,
+                    format_name="wav",
+                )
+            )
+        return AudioInspection(
+            AudioMetadata(
+                duration_seconds=4245.0,
+                codec_name="aac",
+                sample_rate=44100,
+                channels=2,
+                bit_rate=128000,
+                format_name="aac",
+            ),
+            warning=raw_aac_warning,
+        )
+
+    def fake_create_chunk(_source_path: Path, chunk: ChunkPlanItem) -> None:
+        created_chunks.append(chunk)
+
+    monkeypatch.setattr("app.transcribe.inspect_audio", fake_inspect_audio)
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-36, max_volume_db=-10),
+    )
+    monkeypatch.setattr("app.transcribe.normalize_audio", lambda _input, _output: None)
+    monkeypatch.setattr("app.transcribe.create_chunk", fake_create_chunk)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--backend",
+            "fake",
+            "--chunk-minutes",
+            "72",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    run_log = (output_dir / "run.log").read_text(encoding="utf-8")
+    assert exit_code == 0
+    assert len(created_chunks) == 2
+    assert created_chunks[1].offset_seconds == 4320.0
+    assert created_chunks[1].duration_seconds == 96.0
+    assert metadata["input_duration_seconds"] is None
+    assert metadata["source_duration_seconds"] == 4416.0
+    assert metadata["original_audio"]["duration_seconds"] == 4245.0
+    assert metadata["source_audio"]["duration_seconds"] == 4416.0
+    assert raw_aac_warning in metadata["warnings"]
+    assert f"warning={raw_aac_warning}" in run_log
+    assert "Audio      : 01:13:36" in captured.out
+
+
+def test_runner_warns_when_raw_aac_duration_is_used_for_planning(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "lecture.aac"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    raw_aac_warning = (
+        "ffprobe warning: Estimating duration from bitrate, this may be inaccurate"
+    )
+
+    monkeypatch.setattr(
+        "app.transcribe.inspect_audio",
+        lambda _path: AudioInspection(
+            AudioMetadata(
+                duration_seconds=4245.0,
+                codec_name="aac",
+                sample_rate=44100,
+                channels=2,
+                bit_rate=128000,
+                format_name="aac",
+            ),
+            warning=raw_aac_warning,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
+    )
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--backend",
+            "fake",
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    run_log = (output_dir / "run.log").read_text(encoding="utf-8")
+    assert exit_code == 0
+    assert raw_aac_warning in metadata["warnings"]
+    assert any("chunk planning may be inaccurate" in warning for warning in metadata["warnings"])
+    assert "warning=chunk planning may be inaccurate" in run_log

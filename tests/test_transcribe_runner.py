@@ -2,9 +2,26 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from app.audio import AudioInspection, AudioMetadata, ChunkPlanItem, VolumeStats
 from app.segments import TranscriptionSegment
 from app.transcribe import main
+
+
+@pytest.fixture(autouse=True)
+def fake_source_audio_creation(monkeypatch) -> None:
+    def fake_create_source_audio(
+        _input_path: Path,
+        output_wav_path: Path,
+        *,
+        normalize: bool,
+    ) -> None:
+        _ = normalize
+        output_wav_path.parent.mkdir(parents=True, exist_ok=True)
+        output_wav_path.write_bytes(b"fake source wav")
+
+    monkeypatch.setattr("app.transcribe.create_source_audio", fake_create_source_audio)
 
 
 def test_fake_runner_writes_outputs_with_default_stem(tmp_path, capsys) -> None:
@@ -111,11 +128,14 @@ def test_fake_runner_metadata_contains_runtime_contract_fields(tmp_path) -> None
     assert "audio" in metadata
     assert "original_audio" in metadata
     assert "source_audio" in metadata
+    assert metadata["canonical_source_path"] == "lecture.source.wav"
+    assert metadata["source_path"] == "lecture.source.wav"
     assert metadata["chunking_enabled"] is True
     assert metadata["chunk_minutes"] == 20
     assert metadata["chunks_count"] == 0
     assert metadata["preprocess_mode"] == "auto"
     assert metadata["preprocessing_applied"] is False
+    assert metadata["audio_preparation_applied"] is True
 
 
 def test_invalid_extension_exits_nonzero_and_writes_no_outputs(tmp_path, capsys) -> None:
@@ -148,7 +168,7 @@ def test_runner_accepts_faster_whisper_backend_when_available(tmp_path, monkeypa
 
     class FakeSession:
         def transcribe(self, backend_input_path):
-            assert backend_input_path == input_path
+            assert backend_input_path == output_dir / ".work" / "source" / "lecture.source.wav"
             return []
 
     def fake_create_backend_session(backend, config):
@@ -368,17 +388,22 @@ def test_runner_preprocess_auto_normalizes_quiet_audio(tmp_path, monkeypatch) ->
     input_path = tmp_path / "lecture.m4a"
     input_path.write_bytes(b"fake audio")
     output_dir = tmp_path / "out"
-    normalized_paths: list[Path] = []
+    source_calls: list[tuple[Path, bool]] = []
 
     monkeypatch.setattr(
         "app.transcribe.detect_volume",
         lambda _path: VolumeStats(mean_volume_db=-36, max_volume_db=-10),
     )
 
-    def fake_normalize(_input_path: Path, output_wav_path: Path) -> None:
-        normalized_paths.append(output_wav_path)
+    def fake_create_source_audio(
+        _input_path: Path,
+        output_wav_path: Path,
+        *,
+        normalize: bool,
+    ) -> None:
+        source_calls.append((output_wav_path, normalize))
 
-    monkeypatch.setattr("app.transcribe.normalize_audio", fake_normalize)
+    monkeypatch.setattr("app.transcribe.create_source_audio", fake_create_source_audio)
 
     exit_code = main(
         [
@@ -394,12 +419,101 @@ def test_runner_preprocess_auto_normalizes_quiet_audio(tmp_path, monkeypatch) ->
 
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
     assert exit_code == 0
-    assert len(normalized_paths) == 1
+    assert source_calls == [(output_dir / ".work" / "source" / "lecture.source.wav", True)]
     assert metadata["preprocessing_applied"] is True
-    assert metadata["preprocessed_path"] == "lecture.normalized.wav"
+    assert metadata["audio_preparation_applied"] is True
+    assert metadata["canonical_source_path"] == "lecture.source.wav"
+    assert metadata["preprocessed_path"] == "lecture.source.wav"
 
 
-def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
+def test_runner_preprocess_auto_normal_audio_creates_source_without_loudnorm(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    source_calls: list[tuple[Path, bool]] = []
+
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
+    )
+
+    def fake_create_source_audio(
+        _input_path: Path,
+        output_wav_path: Path,
+        *,
+        normalize: bool,
+    ) -> None:
+        source_calls.append((output_wav_path, normalize))
+
+    monkeypatch.setattr("app.transcribe.create_source_audio", fake_create_source_audio)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--backend",
+            "fake",
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert source_calls == [(output_dir / ".work" / "source" / "lecture.source.wav", False)]
+    assert metadata["preprocessing_applied"] is False
+    assert metadata["audio_preparation_applied"] is True
+    assert metadata["preprocessed_path"] is None
+
+
+def test_runner_preprocess_off_still_creates_canonical_source(tmp_path, monkeypatch) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    source_calls: list[tuple[Path, bool]] = []
+
+    def fail_detect_volume(_path: Path) -> VolumeStats:
+        raise AssertionError("volumedetect should not run when preprocessing is off")
+
+    def fake_create_source_audio(
+        _input_path: Path,
+        output_wav_path: Path,
+        *,
+        normalize: bool,
+    ) -> None:
+        source_calls.append((output_wav_path, normalize))
+
+    monkeypatch.setattr("app.transcribe.detect_volume", fail_detect_volume)
+    monkeypatch.setattr("app.transcribe.create_source_audio", fake_create_source_audio)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--backend",
+            "fake",
+            "--preprocess",
+            "off",
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert source_calls == [(output_dir / ".work" / "source" / "lecture.source.wav", False)]
+    assert metadata["preprocess_mode"] == "off"
+    assert metadata["preprocessing_applied"] is False
+    assert metadata["audio_preparation_applied"] is True
+    assert metadata["canonical_source_path"] == "lecture.source.wav"
+
+
+def test_runner_uses_canonical_source_duration_for_chunk_planning_when_preprocess_off(
     tmp_path,
     monkeypatch,
     capsys,
@@ -411,9 +525,10 @@ def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
         "ffprobe warning: Estimating duration from bitrate, this may be inaccurate"
     )
     created_chunks: list[ChunkPlanItem] = []
+    source_calls: list[tuple[Path, bool]] = []
 
     def fake_inspect_audio(path: Path) -> AudioInspection:
-        if path.suffix == ".wav":
+        if path.name == "lecture.source.wav":
             return AudioInspection(
                 AudioMetadata(
                     duration_seconds=4416.0,
@@ -439,12 +554,16 @@ def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
     def fake_create_chunk(_source_path: Path, chunk: ChunkPlanItem) -> None:
         created_chunks.append(chunk)
 
+    def fake_create_source_audio(
+        _input_path: Path,
+        output_wav_path: Path,
+        *,
+        normalize: bool,
+    ) -> None:
+        source_calls.append((output_wav_path, normalize))
+
     monkeypatch.setattr("app.transcribe.inspect_audio", fake_inspect_audio)
-    monkeypatch.setattr(
-        "app.transcribe.detect_volume",
-        lambda _path: VolumeStats(mean_volume_db=-36, max_volume_db=-10),
-    )
-    monkeypatch.setattr("app.transcribe.normalize_audio", lambda _input, _output: None)
+    monkeypatch.setattr("app.transcribe.create_source_audio", fake_create_source_audio)
     monkeypatch.setattr("app.transcribe.create_chunk", fake_create_chunk)
 
     exit_code = main(
@@ -458,6 +577,8 @@ def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
             "fake",
             "--chunk-minutes",
             "72",
+            "--preprocess",
+            "off",
         ]
     )
 
@@ -465,6 +586,7 @@ def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
     run_log = (output_dir / "run.log").read_text(encoding="utf-8")
     assert exit_code == 0
+    assert source_calls == [(output_dir / ".work" / "source" / "lecture.source.wav", False)]
     assert len(created_chunks) == 2
     assert created_chunks[1].offset_seconds == 4320.0
     assert created_chunks[1].duration_seconds == 96.0
@@ -472,12 +594,15 @@ def test_runner_uses_preprocessed_source_duration_for_chunk_planning(
     assert metadata["source_duration_seconds"] == 4416.0
     assert metadata["original_audio"]["duration_seconds"] == 4245.0
     assert metadata["source_audio"]["duration_seconds"] == 4416.0
+    assert metadata["preprocess_mode"] == "off"
+    assert metadata["preprocessing_applied"] is False
+    assert metadata["audio_preparation_applied"] is True
     assert raw_aac_warning in metadata["warnings"]
     assert f"warning={raw_aac_warning}" in run_log
     assert "Audio      : 01:13:36" in captured.out
 
 
-def test_runner_warns_when_raw_aac_duration_is_used_for_planning(
+def test_runner_keeps_raw_aac_duration_warning_as_informational(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -488,9 +613,19 @@ def test_runner_warns_when_raw_aac_duration_is_used_for_planning(
         "ffprobe warning: Estimating duration from bitrate, this may be inaccurate"
     )
 
-    monkeypatch.setattr(
-        "app.transcribe.inspect_audio",
-        lambda _path: AudioInspection(
+    def fake_inspect_audio(path: Path) -> AudioInspection:
+        if path.name == "lecture.source.wav":
+            return AudioInspection(
+                AudioMetadata(
+                    duration_seconds=4416.0,
+                    codec_name="pcm_s16le",
+                    sample_rate=16000,
+                    channels=1,
+                    bit_rate=None,
+                    format_name="wav",
+                )
+            )
+        return AudioInspection(
             AudioMetadata(
                 duration_seconds=4245.0,
                 codec_name="aac",
@@ -500,8 +635,9 @@ def test_runner_warns_when_raw_aac_duration_is_used_for_planning(
                 format_name="aac",
             ),
             warning=raw_aac_warning,
-        ),
-    )
+        )
+
+    monkeypatch.setattr("app.transcribe.inspect_audio", fake_inspect_audio)
     monkeypatch.setattr(
         "app.transcribe.detect_volume",
         lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
@@ -524,5 +660,8 @@ def test_runner_warns_when_raw_aac_duration_is_used_for_planning(
     run_log = (output_dir / "run.log").read_text(encoding="utf-8")
     assert exit_code == 0
     assert raw_aac_warning in metadata["warnings"]
-    assert any("chunk planning may be inaccurate" in warning for warning in metadata["warnings"])
-    assert "warning=chunk planning may be inaccurate" in run_log
+    assert metadata["source_duration_seconds"] == 4416.0
+    assert not any(
+        "chunk planning may be inaccurate" in warning for warning in metadata["warnings"]
+    )
+    assert f"warning={raw_aac_warning}" in run_log

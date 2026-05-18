@@ -9,6 +9,7 @@ from app.audio import (
     build_chunk_command,
     build_ffprobe_command,
     build_preprocess_command,
+    build_source_audio_command,
     build_volumedetect_command,
     inspect_audio,
     is_supported_audio_path,
@@ -235,7 +236,24 @@ def test_build_preprocess_command() -> None:
     ]
     assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
     assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
+    assert ["-c:a", "pcm_s16le"] == command[command.index("-c:a") : command.index("-c:a") + 2]
     assert command[-1] == str(output_wav_path)
+
+
+def test_build_source_audio_command_without_normalization() -> None:
+    command = build_source_audio_command(
+        Path("audio/lecture.m4a"),
+        Path("tmp/lecture.source.wav"),
+        normalize=False,
+    )
+
+    assert command[0] == "ffmpeg"
+    assert "-af" not in command
+    assert command[command.index("-i") + 1] == "audio/lecture.m4a"
+    assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
+    assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
+    assert ["-c:a", "pcm_s16le"] == command[command.index("-c:a") : command.index("-c:a") + 2]
+    assert command[-1] == "tmp/lecture.source.wav"
 
 
 def test_build_volumedetect_command() -> None:

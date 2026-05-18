@@ -14,9 +14,9 @@ from app.audio import (
     INACCURATE_DURATION_WARNING_TEXT,
     ChunkPlanItem,
     create_chunk,
+    create_source_audio,
     detect_volume,
     inspect_audio,
-    normalize_audio,
     plan_chunks,
     should_auto_normalize,
     validate_supported_audio_path,
@@ -63,32 +63,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     original_audio_metadata = original_audio_inspection.metadata
     start_time = time.monotonic()
     try:
-        preprocessing = _prepare_preprocessed_input(
+        source_preparation = _prepare_source_audio(
             input_path=input_path,
             output_dir=output_dir,
             stem=stem,
-            mode=args.preprocess,
+            preprocess_mode=args.preprocess,
         )
     except subprocess.CalledProcessError as exc:
         print(
             format_failure_summary(
-                FailureReport(stage="preprocessing", error=_called_process_error_message(exc))
+                FailureReport(stage="audio preparation", error=_called_process_error_message(exc))
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(
+            format_failure_summary(
+                FailureReport(stage="audio preparation", error=f"ffmpeg failed: {exc}")
             ),
             file=sys.stderr,
         )
         return 1
 
-    source_path = preprocessing["source_path"]
-    preprocessing_applied = bool(preprocessing["applied"])
-    source_audio_inspection = (
-        inspect_audio(source_path) if preprocessing_applied else original_audio_inspection
-    )
+    source_path = source_preparation["source_path"]
+    preprocessing_applied = bool(source_preparation["preprocessing_applied"])
+    source_audio_inspection = inspect_audio(source_path)
     source_audio_metadata = source_audio_inspection.metadata
     chunks = plan_chunks(
-        duration_seconds=_chunk_planning_duration_seconds(
-            source_audio_metadata,
-            original_audio_metadata,
-        ),
+        duration_seconds=source_audio_metadata.duration_seconds,
         chunk_minutes=args.chunk_minutes,
         output_dir=output_dir,
         stem=stem,
@@ -131,12 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     elapsed_seconds = time.monotonic() - start_time
     transcribed_duration_seconds = _transcribed_duration_seconds(segments)
-    finish_audio_duration_seconds = _finish_audio_duration_seconds(
-        original_audio_metadata=original_audio_metadata,
-        source_audio_metadata=source_audio_metadata,
-        original_warning=original_audio_inspection.warning,
-        preprocessing_applied=preprocessing_applied,
-    )
+    finish_audio_duration_seconds = source_audio_metadata.duration_seconds
     realtime_duration_seconds = finish_audio_duration_seconds
     if realtime_duration_seconds is None:
         realtime_duration_seconds = transcribed_duration_seconds
@@ -145,12 +143,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     warnings = _warnings(
         original_audio_inspection.warning,
-        source_audio_inspection.warning if preprocessing_applied else None,
-        preprocessing["warning"],
-        _chunk_planning_warning(
-            original_warning=original_audio_inspection.warning,
-            preprocessing_applied=preprocessing_applied,
-        ),
+        source_audio_inspection.warning,
+        source_preparation["warning"],
     )
     metadata = {
         "input_path": str(input_path),
@@ -174,10 +168,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "chunks_count": len(chunks),
         "chunks": [_chunk_metadata(chunk) for chunk in chunks],
         "preprocess_mode": args.preprocess,
-        "preprocessing_applied": preprocessing["applied"],
-        "mean_volume_db": preprocessing["mean_volume_db"],
-        "max_volume_db": preprocessing["max_volume_db"],
-        "preprocessed_path": preprocessing["preprocessed_path"],
+        "preprocessing_applied": source_preparation["preprocessing_applied"],
+        "audio_preparation_applied": source_preparation["audio_preparation_applied"],
+        "mean_volume_db": source_preparation["mean_volume_db"],
+        "max_volume_db": source_preparation["max_volume_db"],
+        "canonical_source_path": source_path.name,
+        "source_path": source_path.name,
+        "preprocessed_path": source_path.name if preprocessing_applied else None,
         "warnings": warnings,
     }
     log_lines = [
@@ -188,6 +185,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"backend={args.backend}",
         f"input_duration_seconds={metadata['input_duration_seconds']}",
         f"source_duration_seconds={source_audio_metadata.duration_seconds}",
+        f"canonical_source_path={source_path.name}",
+        f"source_path={source_path.name}",
         f"transcribed_duration_seconds={transcribed_duration_seconds}",
         f"elapsed_seconds={elapsed_seconds}",
         f"realtime_factor={realtime_factor}",
@@ -195,9 +194,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"chunk_minutes={args.chunk_minutes}",
         f"chunks_count={len(chunks)}",
         f"preprocess_mode={args.preprocess}",
-        f"preprocessing_applied={preprocessing['applied']}",
-        f"mean_volume_db={preprocessing['mean_volume_db']}",
-        f"max_volume_db={preprocessing['max_volume_db']}",
+        f"preprocessing_applied={source_preparation['preprocessing_applied']}",
+        f"audio_preparation_applied={source_preparation['audio_preparation_applied']}",
+        f"mean_volume_db={source_preparation['mean_volume_db']}",
+        f"max_volume_db={source_preparation['max_volume_db']}",
         f"segments={len(segments)}",
         *[f"warning={warning}" for warning in metadata["warnings"]],
     ]
@@ -248,15 +248,6 @@ def _transcribed_duration_seconds(segments) -> float:
     return max(segment.end for segment in segments)
 
 
-def _chunk_planning_duration_seconds(
-    source_audio_metadata,
-    original_audio_metadata,
-) -> float | None:
-    if source_audio_metadata.duration_seconds is not None:
-        return source_audio_metadata.duration_seconds
-    return original_audio_metadata.duration_seconds
-
-
 def _reliable_input_duration_seconds(
     original_audio_metadata,
     original_warning: str | None,
@@ -266,74 +257,33 @@ def _reliable_input_duration_seconds(
     return original_audio_metadata.duration_seconds
 
 
-def _finish_audio_duration_seconds(
-    *,
-    original_audio_metadata,
-    source_audio_metadata,
-    original_warning: str | None,
-    preprocessing_applied: bool,
-) -> float | None:
-    if (
-        source_audio_metadata.duration_seconds is not None
-        and (
-            preprocessing_applied
-            or _has_inaccurate_duration_warning(original_warning)
-            or original_audio_metadata.duration_seconds is None
-        )
-    ):
-        return source_audio_metadata.duration_seconds
-    return original_audio_metadata.duration_seconds
-
-
-def _prepare_preprocessed_input(
+def _prepare_source_audio(
     *,
     input_path: Path,
     output_dir: Path,
     stem: str,
-    mode: str,
+    preprocess_mode: str,
 ) -> dict[str, object]:
     stats = None
     warning = None
-    applied = False
-    source_path = input_path
-    preprocessed_path = None
+    normalize = False
 
-    if mode == "off":
-        return {
-            "source_path": source_path,
-            "applied": applied,
-            "mean_volume_db": None,
-            "max_volume_db": None,
-            "preprocessed_path": preprocessed_path,
-            "warning": warning,
-        }
-
-    if mode == "auto":
+    if preprocess_mode == "auto":
         stats = detect_volume(input_path)
         warning = stats.warning
-        should_normalize = warning is None and should_auto_normalize(stats)
-    else:
-        should_normalize = True
+        normalize = warning is None and should_auto_normalize(stats)
+    elif preprocess_mode == "normalize":
+        normalize = True
 
-    if should_normalize:
-        normalized_path = output_dir / ".work" / "preprocessed" / f"{stem}.normalized.wav"
-        try:
-            normalize_audio(input_path, normalized_path)
-        except subprocess.CalledProcessError:
-            if mode == "normalize":
-                raise
-            warning = "auto preprocessing selected normalization but ffmpeg normalization failed"
-        else:
-            source_path = normalized_path
-            preprocessed_path = normalized_path.name
-            applied = True
+    source_path = output_dir / ".work" / "source" / f"{stem}.source.wav"
+    create_source_audio(input_path, source_path, normalize=normalize)
 
     return {
         "source_path": source_path,
-        "applied": applied,
+        "preprocessing_applied": normalize,
+        "audio_preparation_applied": True,
         "mean_volume_db": stats.mean_volume_db if stats is not None else None,
         "max_volume_db": stats.max_volume_db if stats is not None else None,
-        "preprocessed_path": preprocessed_path,
         "warning": warning,
     }
 
@@ -403,16 +353,6 @@ def _warnings(*warnings: object) -> list[str]:
         if warning_text not in unique_warnings:
             unique_warnings.append(warning_text)
     return unique_warnings
-
-
-def _chunk_planning_warning(
-    *,
-    original_warning: str | None,
-    preprocessing_applied: bool,
-) -> str | None:
-    if _has_inaccurate_duration_warning(original_warning) and not preprocessing_applied:
-        return "chunk planning may be inaccurate because ffprobe estimated duration from bitrate"
-    return None
 
 
 def _has_inaccurate_duration_warning(warning: str | None) -> bool:

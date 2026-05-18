@@ -6,6 +6,7 @@ import math
 from collections.abc import Mapping
 from pathlib import Path
 
+from app.audio import AudioMetadata
 from app.errors import FailureReport
 
 SEPARATOR = "────────────────────────────────────────"
@@ -19,7 +20,20 @@ def format_start_summary(
     model: str,
     duration_seconds: float | None = None,
     audio: str | None = None,
+    chunking: str | None = None,
+    preprocess: str | None = None,
 ) -> str:
+    runtime_lines = [
+        "Runtime",
+        f"  Mode       : {mode}",
+        f"  Selected   : {selected_device.upper()}",
+        f"  Model      : {model}",
+    ]
+    if chunking is not None:
+        runtime_lines.append(f"  Chunking   : {chunking}")
+    if preprocess is not None:
+        runtime_lines.append(f"  Preprocess : {preprocess}")
+
     return "\n".join(
         [
             SEPARATOR,
@@ -30,10 +44,7 @@ def format_start_summary(
             f"  Duration   : {_duration_or_unknown(duration_seconds)}",
             f"  Audio      : {audio or 'not inspected'}",
             "",
-            "Runtime",
-            f"  Mode       : {mode}",
-            f"  Selected   : {selected_device.upper()}",
-            f"  Model      : {model}",
+            *runtime_lines,
             SEPARATOR,
         ]
     )
@@ -69,21 +80,27 @@ def format_progress_line(
 
 def format_finish_summary(
     *,
-    duration_seconds: float,
+    audio_duration_seconds: float | None,
+    transcribed_duration_seconds: float,
     elapsed_seconds: float,
     device: str,
     model: str,
     files: Mapping[str, Path],
 ) -> str:
+    realtime_duration = audio_duration_seconds
+    if realtime_duration is None:
+        realtime_duration = transcribed_duration_seconds
+
     return "\n".join(
         [
             SEPARATOR,
             "Transcription complete",
             "",
             "Finish",
-            f"  Duration   : {format_clock(duration_seconds)}",
+            f"  Audio      : {_duration_or_unknown(audio_duration_seconds)}",
+            f"  Transcribed: {format_clock(transcribed_duration_seconds)}",
             f"  Elapsed    : {format_clock(elapsed_seconds)}",
-            f"  Realtime   : {_realtime_factor(duration_seconds, elapsed_seconds)}x",
+            f"  Realtime   : {_realtime_factor(realtime_duration, elapsed_seconds)}x",
             f"  Device     : {device.upper()}",
             f"  Model      : {model}",
             "",
@@ -118,6 +135,22 @@ def format_clock(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{timestamp_seconds:02d}"
 
 
+def format_audio_info(metadata: AudioMetadata) -> str | None:
+    """Format ffprobe audio metadata for the start summary."""
+    parts = []
+    if metadata.codec_name:
+        parts.append(metadata.codec_name)
+    if metadata.sample_rate:
+        parts.append(_format_sample_rate(metadata.sample_rate))
+    if metadata.channels:
+        parts.append(_format_channels(metadata.channels))
+    if metadata.bit_rate:
+        parts.append(_format_bit_rate(metadata.bit_rate))
+    if not parts:
+        return None
+    return ", ".join(parts)
+
+
 def _duration_or_unknown(seconds: float | None) -> str:
     if seconds is None:
         return "unknown"
@@ -138,3 +171,23 @@ def _realtime_factor(duration_seconds: float, elapsed_seconds: float) -> str:
 
 def _short_model_name(model: str) -> str:
     return model.rsplit("/", maxsplit=1)[-1].removeprefix("faster-whisper-")
+
+
+def _format_sample_rate(sample_rate: int) -> str:
+    if sample_rate % 1000 == 0:
+        return f"{sample_rate // 1000} kHz"
+    return f"{sample_rate / 1000:.1f} kHz"
+
+
+def _format_channels(channels: int) -> str:
+    if channels == 1:
+        return "mono"
+    if channels == 2:
+        return "stereo"
+    return f"{channels} channels"
+
+
+def _format_bit_rate(bit_rate: int) -> str:
+    if bit_rate >= 1000:
+        return f"{round(bit_rate / 1000)} kbps"
+    return f"{bit_rate} bps"

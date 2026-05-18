@@ -41,6 +41,9 @@ def test_dry_run_default_mode_auto() -> None:
     assert result.returncode == 0
     assert "mode=auto" in result.stdout
     assert "selected_device=auto" in result.stdout
+    assert "chunk_minutes=20" in result.stdout
+    assert "chunking_enabled=true" in result.stdout
+    assert "preprocess=auto" in result.stdout
     assert "podman_image=local-stt-runtime" in result.stdout
 
 
@@ -86,6 +89,16 @@ def test_unknown_option_returns_nonzero() -> None:
 
 def test_missing_out_value_returns_nonzero() -> None:
     result = run_transcribe("input.m4a", "--out")
+    assert result.returncode != 0
+
+
+def test_missing_chunk_minutes_value_returns_nonzero() -> None:
+    result = run_transcribe("input.m4a", "--chunk-minutes")
+    assert result.returncode != 0
+
+
+def test_invalid_preprocess_value_returns_nonzero() -> None:
+    result = run_transcribe("input.m4a", "--preprocess", "denoise")
     assert result.returncode != 0
 
 
@@ -143,6 +156,38 @@ def test_out_dir_passes_output_dir_to_runner(tmp_path) -> None:
 
     assert result.returncode == 0
     assert "--output-dir transcripts" in podman_log.read_text(encoding="utf-8")
+
+
+def test_chunk_minutes_passes_to_runner(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log)
+
+    result = run_transcribe("input.m4a", "--chunk-minutes", "15", env=env)
+
+    assert result.returncode == 0
+    assert "--chunk-minutes 15" in transcribe_run_line(podman_log.read_text(encoding="utf-8"))
+
+
+def test_no_chunk_passes_to_runner(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log)
+
+    result = run_transcribe("input.m4a", "--no-chunk", env=env)
+
+    assert result.returncode == 0
+    assert "--no-chunk" in transcribe_run_line(podman_log.read_text(encoding="utf-8"))
+
+
+def test_preprocess_passes_to_runner(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log)
+
+    result = run_transcribe("input.m4a", "--preprocess", "normalize", env=env)
+
+    assert result.returncode == 0
+    assert "--preprocess normalize" in transcribe_run_line(
+        podman_log.read_text(encoding="utf-8")
+    )
 
 
 def test_gpu_mode_cuda_check_failure_returns_nonzero_without_cpu_fallback(tmp_path) -> None:

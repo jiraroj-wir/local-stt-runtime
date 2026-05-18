@@ -8,7 +8,11 @@ import pytest
 
 from app.config import cpu_config, cuda_config
 from app.segments import TranscriptionSegment
-from app.whisper_backend import MISSING_FASTER_WHISPER_MESSAGE, transcribe_faster_whisper
+from app.whisper_backend import (
+    MISSING_FASTER_WHISPER_MESSAGE,
+    create_faster_whisper_session,
+    transcribe_faster_whisper,
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,20 @@ def test_faster_whisper_cpu_model_omits_auto_cpu_threads(monkeypatch) -> None:
             "device": "cpu",
             "compute_type": "int8",
         }
+    ]
+
+
+def test_faster_whisper_session_reuses_model_for_multiple_inputs(monkeypatch) -> None:
+    install_fake_faster_whisper(monkeypatch)
+
+    session = create_faster_whisper_session(cuda_config())
+    session.transcribe(Path("chunk-1.wav"))
+    session.transcribe(Path("chunk-2.wav"))
+
+    assert len(FakeWhisperModel.init_calls) == 1
+    assert [call["input_path"] for call in FakeWhisperModel.transcribe_calls] == [
+        "chunk-1.wav",
+        "chunk-2.wav",
     ]
 
 

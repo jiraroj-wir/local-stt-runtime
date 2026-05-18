@@ -13,6 +13,9 @@ Options:
   --gpu             Force GPU mode.
   --cpu             Force CPU mode.
   --out DIR         Use DIR as the exact output directory.
+  --chunk-minutes N Use N-minute chunks for long audio (default: 20).
+  --no-chunk        Disable automatic long-audio chunking.
+  --preprocess MODE Audio preprocessing: auto, off, normalize (default: auto).
   --dry-run         Print resolved values without running transcription.
 USAGE
 }
@@ -29,6 +32,9 @@ mode="auto"
 out_dir=""
 dry_run=false
 input_file=""
+chunk_minutes=""
+no_chunk=false
+preprocess="auto"
 image_name="local-stt-runtime"
 cuda_check_image="nvidia/cuda:12.4.1-base-ubuntu22.04"
 
@@ -65,6 +71,36 @@ while (($# > 0)); do
         exit 1
       fi
       out_dir="$1"
+      shift
+      ;;
+    --chunk-minutes)
+      shift
+      if (($# == 0)); then
+        echo "Error: --chunk-minutes requires a numeric argument." >&2
+        exit 1
+      fi
+      chunk_minutes="$1"
+      shift
+      ;;
+    --no-chunk)
+      no_chunk=true
+      shift
+      ;;
+    --preprocess)
+      shift
+      if (($# == 0)); then
+        echo "Error: --preprocess requires one of: auto, off, normalize." >&2
+        exit 1
+      fi
+      case "$1" in
+        auto|off|normalize)
+          preprocess="$1"
+          ;;
+        *)
+          echo "Error: --preprocess requires one of: auto, off, normalize." >&2
+          exit 1
+          ;;
+      esac
       shift
       ;;
     --dry-run)
@@ -112,6 +148,13 @@ if [[ "$dry_run" == "true" ]]; then
   echo "output_dir=$out_dir"
   echo "mode=$mode"
   echo "selected_device=$planned_device"
+  if [[ -n "$chunk_minutes" ]]; then
+    echo "chunk_minutes=$chunk_minutes"
+  else
+    echo "chunk_minutes=20"
+  fi
+  echo "chunking_enabled=$([[ "$no_chunk" == "true" ]] && echo false || echo true)"
+  echo "preprocess=$preprocess"
   echo "podman_image=$image_name"
   exit 0
 fi
@@ -183,6 +226,15 @@ podman_args+=(
   --device "$device"
   --mode "$mode"
   --backend faster-whisper
+  --preprocess "$preprocess"
 )
+
+if [[ -n "$chunk_minutes" ]]; then
+  podman_args+=(--chunk-minutes "$chunk_minutes")
+fi
+
+if [[ "$no_chunk" == "true" ]]; then
+  podman_args+=(--no-chunk)
+fi
 
 podman "${podman_args[@]}"

@@ -1,7 +1,9 @@
 from pathlib import Path
 
+from app.audio import AudioMetadata
 from app.errors import FailureReport
 from app.ui import (
+    format_audio_info,
     format_failure_summary,
     format_finish_summary,
     format_progress_line,
@@ -29,6 +31,20 @@ def test_start_summary_includes_expected_fields() -> None:
     assert "Model      : Systran/faster-whisper-large-v3" in summary
 
 
+def test_start_summary_includes_chunking_and_preprocess_when_provided() -> None:
+    summary = format_start_summary(
+        input_path=Path("audio/lecture.m4a"),
+        mode="auto",
+        selected_device="cuda",
+        model="Systran/faster-whisper-large-v3",
+        chunking="20 min x 6 chunks",
+        preprocess="auto/applied",
+    )
+
+    assert "Chunking   : 20 min x 6 chunks" in summary
+    assert "Preprocess : auto/applied" in summary
+
+
 def test_runtime_fallback_summary_includes_reason_and_cpu_continuation() -> None:
     summary = format_runtime_fallback("CUDA/CDI GPU check failed")
 
@@ -51,7 +67,8 @@ def test_progress_line_formats_percent_timestamps_and_runtime_label() -> None:
 
 def test_finish_summary_includes_elapsed_realtime_and_output_files() -> None:
     summary = format_finish_summary(
-        duration_seconds=120,
+        audio_duration_seconds=120,
+        transcribed_duration_seconds=118,
         elapsed_seconds=30,
         device="cpu",
         model="Systran/faster-whisper-medium.en",
@@ -62,13 +79,58 @@ def test_finish_summary_includes_elapsed_realtime_and_output_files() -> None:
     )
 
     assert "Transcription complete" in summary
-    assert "Duration   : 00:02:00" in summary
+    assert "Audio      : 00:02:00" in summary
+    assert "Transcribed: 00:01:58" in summary
     assert "Elapsed    : 00:00:30" in summary
     assert "Realtime   : 4.00x" in summary
     assert "Device     : CPU" in summary
     assert "Model      : Systran/faster-whisper-medium.en" in summary
     assert "txt        : lecture.txt" in summary
     assert "srt        : lecture.srt" in summary
+
+
+def test_finish_summary_falls_back_to_transcribed_duration_for_realtime() -> None:
+    summary = format_finish_summary(
+        audio_duration_seconds=None,
+        transcribed_duration_seconds=60,
+        elapsed_seconds=30,
+        device="cpu",
+        model="Systran/faster-whisper-medium.en",
+        files={},
+    )
+
+    assert "Audio      : unknown" in summary
+    assert "Realtime   : 2.00x" in summary
+
+
+def test_format_audio_info_formats_ffprobe_metadata() -> None:
+    info = format_audio_info(
+        AudioMetadata(
+            duration_seconds=8022,
+            codec_name="aac",
+            sample_rate=44100,
+            channels=2,
+            bit_rate=128000,
+            format_name="mov,mp4",
+        )
+    )
+
+    assert info == "aac, 44.1 kHz, stereo, 128 kbps"
+
+
+def test_format_audio_info_returns_none_without_audio_fields() -> None:
+    info = format_audio_info(
+        AudioMetadata(
+            duration_seconds=10,
+            codec_name=None,
+            sample_rate=None,
+            channels=None,
+            bit_rate=None,
+            format_name="mov,mp4",
+        )
+    )
+
+    assert info is None
 
 
 def test_failure_summary_includes_stage_error_and_log_path() -> None:

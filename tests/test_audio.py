@@ -4,10 +4,16 @@ import pytest
 
 from app.audio import (
     AudioMetadata,
+    VolumeStats,
+    build_chunk_command,
     build_ffprobe_command,
     build_preprocess_command,
+    build_volumedetect_command,
     is_supported_audio_path,
     parse_ffprobe_metadata,
+    parse_volumedetect_output,
+    plan_chunks,
+    should_auto_normalize,
     validate_supported_audio_path,
 )
 
@@ -102,7 +108,7 @@ def test_parse_metadata_ignores_video_stream_and_uses_audio_stream() -> None:
         }
     )
 
-    assert metadata.sample_rate_hz == 44100
+    assert metadata.sample_rate == 44100
     assert metadata.channels == 2
     assert metadata.codec_name == "aac"
 
@@ -110,13 +116,18 @@ def test_parse_metadata_ignores_video_stream_and_uses_audio_stream() -> None:
 def test_parse_metadata_parses_audio_and_format_fields() -> None:
     metadata = parse_ffprobe_metadata(
         {
-            "format": {"duration": "120.75", "format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+            "format": {
+                "duration": "120.75",
+                "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                "bit_rate": "128000",
+            },
             "streams": [
                 {
                     "codec_type": "audio",
                     "sample_rate": "48000",
                     "channels": "1",
                     "codec_name": "aac",
+                    "bit_rate": "96000",
                 }
             ],
         }
@@ -124,16 +135,29 @@ def test_parse_metadata_parses_audio_and_format_fields() -> None:
 
     assert metadata == AudioMetadata(
         duration_seconds=120.75,
-        format_name="mov,mp4,m4a,3gp,3g2,mj2",
-        sample_rate_hz=48000,
-        channels=1,
         codec_name="aac",
+        sample_rate=48000,
+        channels=1,
+        bit_rate=96000,
+        format_name="mov,mp4,m4a,3gp,3g2,mj2",
     )
 
 
-def test_parse_metadata_raises_clear_value_error_when_no_duration_available() -> None:
-    with pytest.raises(ValueError, match="usable duration"):
-        parse_ffprobe_metadata({"format": {}, "streams": [{"codec_type": "audio"}]})
+def test_parse_metadata_uses_format_bit_rate_when_stream_bit_rate_missing() -> None:
+    metadata = parse_ffprobe_metadata(
+        {
+            "format": {"duration": "1.0", "bit_rate": "128000"},
+            "streams": [{"codec_type": "audio"}],
+        }
+    )
+
+    assert metadata.bit_rate == 128000
+
+
+def test_parse_metadata_missing_duration_returns_none() -> None:
+    metadata = parse_ffprobe_metadata({"format": {}, "streams": [{"codec_type": "audio"}]})
+
+    assert metadata.duration_seconds is None
 
 
 def test_parse_metadata_missing_optional_fields_return_none() -> None:
@@ -141,10 +165,11 @@ def test_parse_metadata_missing_optional_fields_return_none() -> None:
 
     assert metadata == AudioMetadata(
         duration_seconds=1.0,
-        format_name=None,
-        sample_rate_hz=None,
-        channels=None,
         codec_name=None,
+        sample_rate=None,
+        channels=None,
+        bit_rate=None,
+        format_name=None,
     )
 
 
@@ -162,14 +187,15 @@ def test_parse_metadata_invalid_optional_sample_rate_and_channels_return_none() 
         }
     )
 
-    assert metadata.sample_rate_hz is None
+    assert metadata.sample_rate is None
     assert metadata.channels is None
 
 
 @pytest.mark.parametrize("duration", ["not-a-number", "nan", "-1"])
-def test_parse_metadata_invalid_duration_raises_value_error(duration: str) -> None:
-    with pytest.raises(ValueError, match="Invalid ffprobe duration"):
-        parse_ffprobe_metadata({"format": {"duration": duration}, "streams": []})
+def test_parse_metadata_invalid_duration_returns_none(duration: str) -> None:
+    metadata = parse_ffprobe_metadata({"format": {"duration": duration}, "streams": []})
+
+    assert metadata.duration_seconds is None
 
 
 def test_build_preprocess_command() -> None:
@@ -181,7 +207,98 @@ def test_build_preprocess_command() -> None:
     assert command[0] == "ffmpeg"
     assert "-y" in command
     assert command[command.index("-i") + 1] == str(input_path)
+    assert ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"] == command[
+        command.index("-af") : command.index("-af") + 2
+    ]
     assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
     assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
-    assert ["-c:a", "pcm_s16le"] == command[command.index("-c:a") : command.index("-c:a") + 2]
     assert command[-1] == str(output_wav_path)
+
+
+def test_build_volumedetect_command() -> None:
+    command = build_volumedetect_command(Path("audio/lecture.m4a"))
+
+    assert command[0] == "ffmpeg"
+    assert "-af" in command
+    assert "volumedetect" in command
+    assert command[-2:] == ["null", "-"]
+
+
+def test_parse_volumedetect_output_extracts_mean_and_max_volume() -> None:
+    stats = parse_volumedetect_output(
+        "[Parsed_volumedetect_0 @ abc] mean_volume: -36.2 dB\n"
+        "[Parsed_volumedetect_0 @ abc] max_volume: -9.7 dB\n"
+    )
+
+    assert stats == VolumeStats(mean_volume_db=-36.2, max_volume_db=-9.7)
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        (VolumeStats(mean_volume_db=-35.0, max_volume_db=-3.0), True),
+        (VolumeStats(mean_volume_db=-20.0, max_volume_db=-12.0), True),
+        (VolumeStats(mean_volume_db=-34.9, max_volume_db=-11.9), False),
+        (VolumeStats(mean_volume_db=None, max_volume_db=None), False),
+    ],
+)
+def test_auto_preprocessing_decision_thresholds(stats: VolumeStats, expected: bool) -> None:
+    assert should_auto_normalize(stats) is expected
+
+
+def test_plan_chunks_19_minutes_no_chunks(tmp_path) -> None:
+    chunks = plan_chunks(
+        duration_seconds=19 * 60,
+        chunk_minutes=20,
+        output_dir=tmp_path,
+        stem="lecture",
+        enabled=True,
+    )
+
+    assert chunks == []
+
+
+def test_plan_chunks_20_minutes_exact_no_chunks(tmp_path) -> None:
+    chunks = plan_chunks(
+        duration_seconds=20 * 60,
+        chunk_minutes=20,
+        output_dir=tmp_path,
+        stem="lecture",
+        enabled=True,
+    )
+
+    assert chunks == []
+
+
+def test_plan_chunks_45_minutes_three_chunks(tmp_path) -> None:
+    chunks = plan_chunks(
+        duration_seconds=45 * 60,
+        chunk_minutes=20,
+        output_dir=tmp_path,
+        stem="lecture",
+        enabled=True,
+    )
+
+    assert [chunk.offset_seconds for chunk in chunks] == [0.0, 1200.0, 2400.0]
+    assert [chunk.duration_seconds for chunk in chunks] == [1200.0, 1200.0, 300.0]
+    assert [chunk.path.name for chunk in chunks] == [
+        "lecture.chunk-0001.wav",
+        "lecture.chunk-0002.wav",
+        "lecture.chunk-0003.wav",
+    ]
+
+
+def test_build_chunk_command() -> None:
+    command = build_chunk_command(
+        Path("lecture.m4a"),
+        Path("chunk.wav"),
+        offset_seconds=1200,
+        duration_seconds=300,
+    )
+
+    assert command[0] == "ffmpeg"
+    assert command[command.index("-ss") + 1] == "1200"
+    assert command[command.index("-t") + 1] == "300"
+    assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
+    assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
+    assert command[-1] == "chunk.wav"

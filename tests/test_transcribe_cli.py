@@ -44,6 +44,7 @@ def test_dry_run_default_mode_auto() -> None:
     assert "chunk_minutes=20" in result.stdout
     assert "chunking_enabled=true" in result.stdout
     assert "isolate_chunks=false" in result.stdout
+    assert "adaptive_fallback=false" in result.stdout
     assert "preprocess=auto" in result.stdout
     assert "podman_image=local-stt-runtime" in result.stdout
 
@@ -189,6 +190,18 @@ def test_isolate_chunks_passes_to_runner(tmp_path) -> None:
     assert "--isolate-chunks" in transcribe_run_line(
         podman_log.read_text(encoding="utf-8")
     )
+
+
+def test_adaptive_fallback_passes_to_runner(tmp_path) -> None:
+    podman_log = tmp_path / "podman.log"
+    env = fake_podman_env(tmp_path, podman_log)
+
+    result = run_transcribe("input.m4a", "--isolate-chunks", "--adaptive-fallback", env=env)
+
+    assert result.returncode == 0
+    run_line = transcribe_run_line(podman_log.read_text(encoding="utf-8"))
+    assert "--isolate-chunks" in run_line
+    assert "--adaptive-fallback" in run_line
 
 
 def test_preprocess_passes_to_runner(tmp_path) -> None:

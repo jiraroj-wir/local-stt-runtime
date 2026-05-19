@@ -7,7 +7,7 @@ import pytest
 
 from app.audio import AudioInspection, AudioMetadata, ChunkPlanItem, VolumeStats
 from app.segments import TranscriptionSegment
-from app.transcribe import _build_parser, main
+from app.transcribe import _build_parser, _is_cuda_oom, main
 
 
 @pytest.fixture(autouse=True)
@@ -359,6 +359,21 @@ def test_runner_parser_accepts_isolate_chunks() -> None:
     assert args.isolate_chunks is True
 
 
+def test_runner_parser_accepts_adaptive_fallback() -> None:
+    args = _build_parser().parse_args(
+        [
+            "lecture.wav",
+            "--output-dir",
+            "out",
+            "--device",
+            "cuda",
+            "--adaptive-fallback",
+        ]
+    )
+
+    assert args.adaptive_fallback is True
+
+
 def test_runner_isolate_chunks_has_no_effect_without_planned_chunks(
     tmp_path,
     monkeypatch,
@@ -589,6 +604,292 @@ def test_runner_isolated_chunk_failure_returns_transcription_error(
     assert not (output_dir / "lecture.json").exists()
 
 
+def test_cuda_oom_detection_is_case_insensitive() -> None:
+    assert _is_cuda_oom(
+        subprocess.CompletedProcess([], 1, stdout="", stderr="CUDA failed with error OUT OF MEMORY")
+    )
+    assert _is_cuda_oom(
+        subprocess.CompletedProcess([], 1, stdout="cuda OUT of MEMORY", stderr="")
+    )
+    assert not _is_cuda_oom(
+        subprocess.CompletedProcess([], 1, stdout="", stderr="permission denied")
+    )
+
+
+def test_runner_adaptive_fallback_requires_isolated_chunks_when_chunked(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    fake_long_audio(monkeypatch, minutes=45)
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--backend",
+            "fake",
+            "--adaptive-fallback",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--adaptive-fallback requires --isolate-chunks" in captured.err
+    assert not (output_dir / "lecture.json").exists()
+
+
+def test_runner_adaptive_fallback_splits_oom_chunk_into_five_minute_subchunks(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    fake_long_audio(monkeypatch, minutes=20, extra_seconds=1)
+    created_fallback_chunks: list[ChunkPlanItem] = []
+
+    def fake_create_chunk(_source: Path, chunk: ChunkPlanItem) -> None:
+        if ".work/fallback_chunks" in str(chunk.path):
+            created_fallback_chunks.append(chunk)
+
+    monkeypatch.setattr("app.transcribe.create_chunk", fake_create_chunk)
+
+    def fake_run(command, **_kwargs):
+        input_name = Path(command[3]).name
+        if input_name == "lecture.chunk-0001.wav":
+            return subprocess.CompletedProcess(
+                command,
+                7,
+                stdout="",
+                stderr="CUDA failed with error out of memory",
+            )
+        write_child_json(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("app.transcribe.subprocess.run", fake_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--mode",
+            "gpu",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+            "--adaptive-fallback",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert "Chunk 1 CUDA OOM; retrying as 5 min subchunks" in captured.out
+    assert [chunk.duration_seconds for chunk in created_fallback_chunks] == [
+        300.0,
+        300.0,
+        300.0,
+        300.0,
+    ]
+    assert metadata["adaptive_fallback"] is True
+    assert metadata["fallback_events"][0]["action"] == "split"
+    assert metadata["child_processes_count"] == 6
+
+
+def test_runner_adaptive_fallback_subchunk_large_v3_cuda_success_merges_offsets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    fake_long_audio(monkeypatch, minutes=45)
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+
+    def fake_run(command, **_kwargs):
+        input_name = Path(command[3]).name
+        if input_name == "lecture.chunk-0002.wav":
+            return subprocess.CompletedProcess(
+                command,
+                7,
+                stdout="",
+                stderr="cuda out of memory",
+            )
+        start = 7.0
+        if "fallback-0002" in input_name:
+            start = 11.0
+        write_child_json(command, start=start)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("app.transcribe.subprocess.run", fake_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--mode",
+            "gpu",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+            "--adaptive-fallback",
+        ]
+    )
+
+    data = json.loads((output_dir / "lecture.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    starts = [segment["start"] for segment in data["segments"]]
+    assert 7.0 in starts
+    assert 1511.0 in starts
+    assert 2407.0 in starts
+
+
+def test_runner_adaptive_fallback_retries_medium_cuda_then_medium_cpu(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    fake_long_audio(monkeypatch, minutes=20, extra_seconds=1)
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        input_name = Path(command[3]).name
+        device = command[command.index("--device") + 1]
+        model = command[command.index("--model") + 1]
+        if input_name == "lecture.chunk-0001.wav":
+            return subprocess.CompletedProcess(
+                command,
+                7,
+                stdout="",
+                stderr="CUDA failed with error out of memory",
+            )
+        if "fallback-0001" in input_name and device == "cuda":
+            return subprocess.CompletedProcess(
+                command,
+                7,
+                stdout="",
+                stderr="CUDA failed with error out of memory",
+            )
+        write_child_json(command, start=3.0, text=f"{model} {device}")
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("app.transcribe.subprocess.run", fake_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--mode",
+            "gpu",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+            "--adaptive-fallback",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    data = json.loads((output_dir / "lecture.json").read_text(encoding="utf-8"))
+    fallback_attempts = [
+        command for command in commands if "fallback-0001" in Path(command[3]).name
+    ]
+    assert exit_code == 0
+    assert [command[command.index("--model") + 1] for command in fallback_attempts[:3]] == [
+        "Systran/faster-whisper-large-v3",
+        "Systran/faster-whisper-medium.en",
+        "Systran/faster-whisper-medium.en",
+    ]
+    assert [command[command.index("--device") + 1] for command in fallback_attempts[:3]] == [
+        "cuda",
+        "cuda",
+        "cpu",
+    ]
+    assert [command[command.index("--mode") + 1] for command in fallback_attempts[:3]] == [
+        "gpu",
+        "gpu",
+        "cpu",
+    ]
+    assert "--adaptive-fallback" not in fallback_attempts[0]
+    assert "--isolate-chunks" not in fallback_attempts[0]
+    assert "Subchunk 1.1 CUDA OOM; retrying medium.en CUDA" in captured.out
+    assert "Subchunk 1.1 medium.en CUDA OOM; retrying medium.en CPU" in captured.out
+    assert data["segments"][0]["text"] == "Systran/faster-whisper-medium.en cpu"
+    assert data["segments"][0]["start"] == 3.0
+    assert metadata["fallback_events"][1]["model"] == "Systran/faster-whisper-medium.en"
+    assert metadata["fallback_events"][1]["device"] == "cuda"
+    assert metadata["fallback_events"][2]["device"] == "cpu"
+    assert metadata["child_processes_count"] == 8
+
+
+def test_runner_adaptive_fallback_non_oom_child_failure_does_not_retry(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    input_path = tmp_path / "lecture.m4a"
+    input_path.write_bytes(b"fake audio")
+    output_dir = tmp_path / "out"
+    fake_long_audio(monkeypatch, minutes=45)
+    monkeypatch.setattr("app.transcribe.create_chunk", lambda _source, _chunk: None)
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            9,
+            stdout="loading model\n",
+            stderr="decoder failed\n",
+        )
+
+    monkeypatch.setattr("app.transcribe.subprocess.run", fake_run)
+
+    exit_code = main(
+        [
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cuda",
+            "--backend",
+            "fake",
+            "--isolate-chunks",
+            "--adaptive-fallback",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert len(commands) == 1
+    assert "isolated chunk 1 failed at offset 00:00:00 with return code 9" in captured.err
+    assert "decoder failed" in captured.err
+    assert not (output_dir / "lecture.json").exists()
+
+
 def test_runner_no_chunk_disables_long_audio_chunking(tmp_path, monkeypatch) -> None:
     input_path = tmp_path / "lecture.m4a"
     input_path.write_bytes(b"fake audio")
@@ -757,6 +1058,53 @@ def test_runner_preprocess_off_still_creates_canonical_source(tmp_path, monkeypa
     assert metadata["preprocessing_applied"] is False
     assert metadata["audio_preparation_applied"] is True
     assert metadata["canonical_source_path"] == "lecture.source.wav"
+
+
+def fake_long_audio(monkeypatch, *, minutes: float, extra_seconds: float = 0.0) -> None:
+    duration_seconds = minutes * 60 + extra_seconds
+    monkeypatch.setattr(
+        "app.transcribe.inspect_audio",
+        lambda _path: AudioInspection(
+            AudioMetadata(
+                duration_seconds=duration_seconds,
+                codec_name="aac",
+                sample_rate=44100,
+                channels=1,
+                bit_rate=None,
+                format_name="mov,mp4",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.transcribe.detect_volume",
+        lambda _path: VolumeStats(mean_volume_db=-20, max_volume_db=-3),
+    )
+
+
+def write_child_json(
+    command: list[str],
+    *,
+    start: float = 5.0,
+    text: str | None = None,
+) -> None:
+    child_output_dir = Path(command[command.index("--output-dir") + 1])
+    child_stem = command[command.index("--stem") + 1]
+    child_output_dir.mkdir(parents=True, exist_ok=True)
+    (child_output_dir / f"{child_stem}.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "start": start,
+                        "end": start + 5.0,
+                        "text": text or f"text from {Path(command[3]).name}",
+                    }
+                ],
+                "metadata": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_runner_uses_canonical_source_duration_for_chunk_planning_when_preprocess_off(

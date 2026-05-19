@@ -16,6 +16,8 @@ Options:
   --chunk-minutes N Use N-minute chunks for long audio (default: 20).
   --no-chunk        Disable automatic long-audio chunking.
   --isolate-chunks  Run each chunk in a fresh Python process.
+  --adaptive-fallback
+                    Retry CUDA OOM chunks as smaller isolated fallback chunks.
   --preprocess MODE Audio preprocessing: auto, off, normalize (default: auto).
   --dry-run         Print resolved values without running transcription.
 USAGE
@@ -36,6 +38,7 @@ input_file=""
 chunk_minutes=""
 no_chunk=false
 isolate_chunks=false
+adaptive_fallback=false
 preprocess="auto"
 image_name="local-stt-runtime"
 cuda_check_image="nvidia/cuda:12.4.1-base-ubuntu22.04"
@@ -90,6 +93,10 @@ while (($# > 0)); do
       ;;
     --isolate-chunks)
       isolate_chunks=true
+      shift
+      ;;
+    --adaptive-fallback)
+      adaptive_fallback=true
       shift
       ;;
     --preprocess)
@@ -161,6 +168,7 @@ if [[ "$dry_run" == "true" ]]; then
   fi
   echo "chunking_enabled=$([[ "$no_chunk" == "true" ]] && echo false || echo true)"
   echo "isolate_chunks=$isolate_chunks"
+  echo "adaptive_fallback=$adaptive_fallback"
   echo "preprocess=$preprocess"
   echo "podman_image=$image_name"
   exit 0
@@ -246,6 +254,10 @@ fi
 
 if [[ "$isolate_chunks" == "true" ]]; then
   podman_args+=(--isolate-chunks)
+fi
+
+if [[ "$adaptive_fallback" == "true" ]]; then
+  podman_args+=(--adaptive-fallback)
 fi
 
 podman "${podman_args[@]}"

@@ -7,7 +7,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -37,6 +37,19 @@ from app.ui import (
 
 DEFAULT_CHUNK_MINUTES = 20.0
 DEFAULT_PREPROCESS_MODE = "auto"
+FALLBACK_CHUNK_SECONDS = 5 * 60.0
+MODEL_ALIASES = {
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "medium.en": "Systran/faster-whisper-medium.en",
+}
+
+
+@dataclass
+class IsolatedTranscriptionResult:
+    segments: list[TranscriptionSegment]
+    child_output_dirs: list[Path]
+    child_processes_count: int
+    fallback_events: list[dict[str, object]]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -57,6 +70,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     config = get_device_config(args.device)
+    if args.model:
+        config = replace(config, model=_resolve_model(args.model))
     mode = args.mode or args.device
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,18 +131,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     chunk_output_dirs = (
         _isolated_chunk_output_dirs(output_dir, chunks) if isolated_chunks else []
     )
+    child_processes_count = len(chunk_output_dirs)
+    fallback_events: list[dict[str, object]] = []
 
     try:
         if chunks:
+            if args.adaptive_fallback and not args.isolate_chunks:
+                raise RuntimeError(
+                    "--adaptive-fallback requires --isolate-chunks when chunking is active"
+                )
             _create_chunks(source_path, chunks, isolated=isolated_chunks)
             if isolated_chunks:
-                segments = _transcribe_chunks_isolated(
+                isolated_result = _transcribe_chunks_isolated(
                     backend=args.backend,
                     config=config,
                     chunks=chunks,
                     output_dir=output_dir,
                     mode=mode,
+                    adaptive_fallback=args.adaptive_fallback,
                 )
+                segments = isolated_result.segments
+                chunk_output_dirs = isolated_result.child_output_dirs
+                child_processes_count = isolated_result.child_processes_count
+                fallback_events = isolated_result.fallback_events
             else:
                 segments = _transcribe_chunks(args.backend, config, chunks)
         else:
@@ -186,7 +212,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "chunk_output_dirs": [
             _relative_output_path(path, output_dir) for path in chunk_output_dirs
         ],
-        "child_processes_count": len(chunk_output_dirs),
+        "child_processes_count": child_processes_count,
+        "adaptive_fallback": args.adaptive_fallback,
+        "fallback_events": fallback_events,
         "preprocess_mode": args.preprocess,
         "preprocessing_applied": source_preparation["preprocessing_applied"],
         "audio_preparation_applied": source_preparation["audio_preparation_applied"],
@@ -214,7 +242,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"chunk_minutes={args.chunk_minutes}",
         f"chunks_count={len(chunks)}",
         f"isolated_chunks={str(isolated_chunks).lower()}",
-        f"child_processes_count={len(chunk_output_dirs)}",
+        f"child_processes_count={child_processes_count}",
+        f"adaptive_fallback={str(args.adaptive_fallback).lower()}",
         f"preprocess_mode={args.preprocess}",
         f"preprocessing_applied={source_preparation['preprocessing_applied']}",
         f"audio_preparation_applied={source_preparation['audio_preparation_applied']}",
@@ -257,6 +286,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-minutes", type=_positive_float, default=DEFAULT_CHUNK_MINUTES)
     parser.add_argument("--no-chunk", action="store_true")
     parser.add_argument("--isolate-chunks", action="store_true")
+    parser.add_argument("--adaptive-fallback", action="store_true")
+    parser.add_argument("--model")
     parser.add_argument(
         "--preprocess",
         choices=["auto", "off", "normalize"],
@@ -349,8 +380,12 @@ def _transcribe_chunks_isolated(
     chunks: list[ChunkPlanItem],
     output_dir: Path,
     mode: str,
-) -> list[TranscriptionSegment]:
+    adaptive_fallback: bool,
+) -> IsolatedTranscriptionResult:
     merged_segments: list[TranscriptionSegment] = []
+    child_output_dirs: list[Path] = []
+    child_processes_count = 0
+    fallback_events: list[dict[str, object]] = []
     for chunk in chunks:
         child_output_dir = _isolated_chunk_output_dir(output_dir, chunk)
         command = _build_isolated_chunk_command(
@@ -359,26 +394,26 @@ def _transcribe_chunks_isolated(
             backend=backend,
             device=config.device,
             mode=_child_process_mode(mode, config.device),
+            model=config.model,
         )
         child_output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            result = subprocess.run(
-                command,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                _isolated_chunk_failure_message(
-                    chunk=chunk,
-                    returncode=None,
-                    stdout="",
-                    stderr=f"failed to start child process: {exc}",
-                )
-            ) from exc
+        result = _run_isolated_chunk_command(command=command, chunk=chunk)
+        child_processes_count += 1
+        child_output_dirs.append(child_output_dir)
 
         if result.returncode != 0:
+            if adaptive_fallback and config.device == "cuda" and _is_cuda_oom(result):
+                fallback_result = _transcribe_chunk_with_adaptive_fallback(
+                    backend=backend,
+                    chunk=chunk,
+                    output_dir=output_dir,
+                    mode=mode,
+                    fallback_events=fallback_events,
+                )
+                merged_segments.extend(fallback_result.segments)
+                child_output_dirs.extend(fallback_result.child_output_dirs)
+                child_processes_count += fallback_result.child_processes_count
+                continue
             raise RuntimeError(
                 _isolated_chunk_failure_message(
                     chunk=chunk,
@@ -390,7 +425,12 @@ def _transcribe_chunks_isolated(
 
         chunk_segments = _read_chunk_segments(child_output_dir, chunk.path.stem)
         merged_segments.extend(offset_segments(chunk_segments, chunk.offset_seconds))
-    return merged_segments
+    return IsolatedTranscriptionResult(
+        segments=merged_segments,
+        child_output_dirs=child_output_dirs,
+        child_processes_count=child_processes_count,
+        fallback_events=fallback_events,
+    )
 
 
 def _build_isolated_chunk_command(
@@ -400,8 +440,9 @@ def _build_isolated_chunk_command(
     backend: str,
     device: str,
     mode: str,
+    model: str | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "app.transcribe",
@@ -420,6 +461,277 @@ def _build_isolated_chunk_command(
         "--mode",
         mode,
     ]
+    if model:
+        command.extend(["--model", model])
+    return command
+
+
+def _run_isolated_chunk_command(
+    *,
+    command: list[str],
+    chunk: ChunkPlanItem,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            _isolated_chunk_failure_message(
+                chunk=chunk,
+                returncode=None,
+                stdout="",
+                stderr=f"failed to start child process: {exc}",
+            )
+        ) from exc
+
+
+def _transcribe_chunk_with_adaptive_fallback(
+    *,
+    backend: str,
+    chunk: ChunkPlanItem,
+    output_dir: Path,
+    mode: str,
+    fallback_events: list[dict[str, object]],
+) -> IsolatedTranscriptionResult:
+    print(
+        f"Chunk {chunk.index} CUDA OOM; retrying as 5 min subchunks",
+        flush=True,
+    )
+    fallback_events.append(
+        _fallback_event(
+            chunk=chunk,
+            action="split",
+            model="Systran/faster-whisper-large-v3",
+            device="cuda",
+            reason="cuda_oom",
+        )
+    )
+
+    subchunks = _fallback_subchunks(output_dir=output_dir, chunk=chunk)
+    for subchunk in subchunks:
+        create_chunk(chunk.path, subchunk)
+
+    merged_segments: list[TranscriptionSegment] = []
+    child_output_dirs: list[Path] = []
+    child_processes_count = 0
+    for subchunk in subchunks:
+        sub_result = _transcribe_fallback_subchunk(
+            backend=backend,
+            parent_chunk=chunk,
+            subchunk=subchunk,
+            output_dir=output_dir,
+            mode=mode,
+            fallback_events=fallback_events,
+        )
+        merged_segments.extend(
+            offset_segments(
+                sub_result.segments,
+                chunk.offset_seconds + subchunk.offset_seconds,
+            )
+        )
+        child_output_dirs.extend(sub_result.child_output_dirs)
+        child_processes_count += sub_result.child_processes_count
+
+    return IsolatedTranscriptionResult(
+        segments=merged_segments,
+        child_output_dirs=child_output_dirs,
+        child_processes_count=child_processes_count,
+        fallback_events=[],
+    )
+
+
+def _transcribe_fallback_subchunk(
+    *,
+    backend: str,
+    parent_chunk: ChunkPlanItem,
+    subchunk: ChunkPlanItem,
+    output_dir: Path,
+    mode: str,
+    fallback_events: list[dict[str, object]],
+) -> IsolatedTranscriptionResult:
+    attempts = [
+        ("large-v3", "Systran/faster-whisper-large-v3", "cuda"),
+        ("medium.en", "Systran/faster-whisper-medium.en", "cuda"),
+        ("medium.en", "Systran/faster-whisper-medium.en", "cpu"),
+    ]
+    child_output_dirs: list[Path] = []
+    child_processes_count = 0
+    previous_oom = False
+
+    for attempt_index, (label, model, device) in enumerate(attempts, start=1):
+        absolute_offset = parent_chunk.offset_seconds + subchunk.offset_seconds
+        if attempt_index == 1:
+            print(
+                f"Subchunk {parent_chunk.index}.{subchunk.index} "
+                f"offset {format_clock(absolute_offset)} "
+                f"duration {format_clock(subchunk.duration_seconds)} "
+                f"{label} CUDA",
+                flush=True,
+            )
+        elif device == "cuda":
+            print(
+                f"Subchunk {parent_chunk.index}.{subchunk.index} "
+                f"CUDA OOM; retrying medium.en CUDA",
+                flush=True,
+            )
+            fallback_events.append(
+                _fallback_event(
+                    chunk=parent_chunk,
+                    subchunk=subchunk,
+                    action="retry",
+                    model=model,
+                    device=device,
+                    reason="cuda_oom",
+                )
+            )
+        else:
+            print(
+                f"Subchunk {parent_chunk.index}.{subchunk.index} "
+                f"medium.en CUDA OOM; retrying medium.en CPU",
+                flush=True,
+            )
+            fallback_events.append(
+                _fallback_event(
+                    chunk=parent_chunk,
+                    subchunk=subchunk,
+                    action="retry",
+                    model=model,
+                    device=device,
+                    reason="cuda_oom",
+                )
+            )
+
+        child_output_dir = _fallback_subchunk_output_dir(
+            output_dir=output_dir,
+            parent_chunk=parent_chunk,
+            subchunk=subchunk,
+            attempt_index=attempt_index,
+        )
+        command = _build_isolated_chunk_command(
+            chunk=subchunk,
+            child_output_dir=child_output_dir,
+            backend=backend,
+            device=device,
+            mode="gpu" if device == "cuda" else "cpu",
+            model=model,
+        )
+        child_output_dir.mkdir(parents=True, exist_ok=True)
+        result = _run_isolated_chunk_command(command=command, chunk=subchunk)
+        child_processes_count += 1
+        child_output_dirs.append(child_output_dir)
+
+        if result.returncode == 0:
+            segments = _read_chunk_segments(child_output_dir, subchunk.path.stem)
+            return IsolatedTranscriptionResult(
+                segments=segments,
+                child_output_dirs=child_output_dirs,
+                child_processes_count=child_processes_count,
+                fallback_events=[],
+            )
+
+        if not (device == "cuda" and _is_cuda_oom(result)):
+            raise RuntimeError(
+                _isolated_subchunk_failure_message(
+                    parent_chunk=parent_chunk,
+                    subchunk=subchunk,
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+            )
+        previous_oom = True
+
+    if previous_oom:
+        raise RuntimeError(
+            f"adaptive fallback failed for chunk {parent_chunk.index} "
+            f"subchunk {subchunk.index} at offset "
+            f"{format_clock(parent_chunk.offset_seconds + subchunk.offset_seconds)}: "
+            "medium.en CPU failed after CUDA OOM retries"
+        )
+    raise RuntimeError("adaptive fallback failed unexpectedly")
+
+
+def _fallback_subchunks(
+    *,
+    output_dir: Path,
+    chunk: ChunkPlanItem,
+) -> list[ChunkPlanItem]:
+    chunks_dir = output_dir / ".work" / "fallback_chunks" / f"chunk-{chunk.index:04d}"
+    subchunks = []
+    offset = 0.0
+    index = 1
+    while offset < chunk.duration_seconds:
+        duration = min(FALLBACK_CHUNK_SECONDS, chunk.duration_seconds - offset)
+        subchunks.append(
+            ChunkPlanItem(
+                index=index,
+                offset_seconds=offset,
+                duration_seconds=duration,
+                path=chunks_dir
+                / f"{chunk.path.stem}.fallback-{index:04d}.wav",
+            )
+        )
+        offset += FALLBACK_CHUNK_SECONDS
+        index += 1
+    return subchunks
+
+
+def _fallback_subchunk_output_dir(
+    *,
+    output_dir: Path,
+    parent_chunk: ChunkPlanItem,
+    subchunk: ChunkPlanItem,
+    attempt_index: int,
+) -> Path:
+    return (
+        output_dir
+        / ".work"
+        / "chunk_outputs"
+        / f"chunk-{parent_chunk.index:04d}"
+        / f"fallback-{subchunk.index:04d}-attempt-{attempt_index}"
+    )
+
+
+def _fallback_event(
+    *,
+    chunk: ChunkPlanItem,
+    action: str,
+    model: str,
+    device: str,
+    reason: str,
+    subchunk: ChunkPlanItem | None = None,
+) -> dict[str, object]:
+    offset_seconds = chunk.offset_seconds
+    duration_seconds = chunk.duration_seconds
+    if subchunk is not None:
+        offset_seconds += subchunk.offset_seconds
+        duration_seconds = subchunk.duration_seconds
+    return {
+        "chunk_index": chunk.index,
+        "offset_seconds": offset_seconds,
+        "duration_seconds": duration_seconds,
+        "action": action,
+        "model": model,
+        "device": device,
+        "reason": reason,
+    }
+
+
+def _is_cuda_oom(result: subprocess.CompletedProcess[str]) -> bool:
+    text = f"{result.stdout}\n{result.stderr}".casefold()
+    return (
+        "out of memory" in text
+        or "cuda failed with error out of memory" in text
+        or "cuda out of memory" in text
+    )
+
+
+def _resolve_model(model: str) -> str:
+    return MODEL_ALIASES.get(model, model)
 
 
 def _child_process_mode(mode: str, device: str) -> str:
@@ -492,6 +804,32 @@ def _isolated_chunk_failure_message(
         first_line = (
             f"isolated chunk {chunk.index} failed at offset "
             f"{format_clock(chunk.offset_seconds)} with return code {returncode}"
+        )
+    summary = _process_output_summary(stdout=stdout, stderr=stderr)
+    if summary:
+        return f"{first_line}\n{summary}"
+    return first_line
+
+
+def _isolated_subchunk_failure_message(
+    *,
+    parent_chunk: ChunkPlanItem,
+    subchunk: ChunkPlanItem,
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+) -> str:
+    absolute_offset = parent_chunk.offset_seconds + subchunk.offset_seconds
+    if returncode is None:
+        first_line = (
+            f"adaptive fallback subchunk {parent_chunk.index}.{subchunk.index} "
+            f"failed at offset {format_clock(absolute_offset)}"
+        )
+    else:
+        first_line = (
+            f"adaptive fallback subchunk {parent_chunk.index}.{subchunk.index} "
+            f"failed at offset {format_clock(absolute_offset)} "
+            f"with return code {returncode}"
         )
     summary = _process_output_summary(stdout=stdout, stderr=stderr)
     if summary:
